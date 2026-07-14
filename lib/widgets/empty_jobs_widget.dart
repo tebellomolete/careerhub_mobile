@@ -1,15 +1,27 @@
 import 'package:flutter/material.dart';
 
-/// Stretch C — shown instead of the job list/grid when there are no
-/// jobs to display.
+/// Stretch C (Assignment 1.1) — shown instead of the job list/grid when
+/// there are no jobs to display.
 ///
-/// Purely presentational: HomeScreen decides *when* to show it (based on
-/// `_jobs.isEmpty`); this widget only knows how to render the empty
-/// state itself. In Week 2, the same widget will render for the
-/// "loaded successfully, zero results" case of `AsyncValue<List<Job>>` —
-/// see README, Stretch C.
+/// Assignment 1.3 change: icon/title/message are now optional
+/// parameters, defaulting to the original Assignment 1.1 copy so nothing
+/// about existing call sites changes. HomeScreen now needs this widget
+/// for TWO distinct empty cases — "no jobs exist at all" and "jobs
+/// exist, but none match the current filter" (README Q3's fourth
+/// condition) — and those deserve different copy: telling a user to
+/// "check back soon" when the real fix is "try a different filter" is
+/// actively misleading.
 class EmptyJobsWidget extends StatelessWidget {
-  const EmptyJobsWidget({super.key});
+  final IconData icon;
+  final String title;
+  final String message;
+
+  const EmptyJobsWidget({
+    super.key,
+    this.icon = Icons.work_off_outlined,
+    this.title = 'No jobs available',
+    this.message = 'Check back soon — new listings are added regularly.',
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -23,13 +35,13 @@ class EmptyJobsWidget extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.work_off_outlined,
+              icon,
               size: 64,
               color: scheme.onSurfaceVariant,
             ),
             const SizedBox(height: 16),
             Text(
-              'No jobs available',
+              title,
               textAlign: TextAlign.center,
               style: textTheme.titleMedium?.copyWith(
                 color: scheme.onSurface,
@@ -38,7 +50,7 @@ class EmptyJobsWidget extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              'Check back soon — new listings are added regularly.',
+              message,
               textAlign: TextAlign.center,
               style: textTheme.bodyMedium?.copyWith(
                 color: scheme.onSurfaceVariant,

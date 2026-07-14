@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'screens/home_screen.dart';
 
 void main() {
-  runApp(const CareerHubApp());
+  // Assignment 1.3, Part 2: wrap runApp in ProviderScope. This is the
+  // ONLY place ProviderScope is added — CareerHubApp itself stays a
+  // plain StatelessWidget, since it never reads a provider directly.
+  runApp(const ProviderScope(child: CareerHubApp()));
 }
 
 class CareerHubApp extends StatelessWidget {

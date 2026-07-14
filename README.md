@@ -434,12 +434,275 @@ Mapping to `AsyncValue<List<Job>>` (Week 2):
   built — Week 2).
 
 ---
+---
 
-## Known pre-existing issue (unrelated to this assignment)
+# CareerHub — Assignment 1.3: Live State & Reactive Filters
 
-`test/widget_test.dart` still contains the default Flutter counter-app
-test, referencing a `MyApp` class and `Icons.add` counter behaviour that
-never existed in CareerHub (the app class has always been
-`CareerHubApp`). This predates Assignment 1.2 and isn't part of its
-requirements, but `flutter test` will fail on it until it's replaced
-with a real test for `CareerHubApp` / `HomeScreen`.
+Week 1, Day 3. Builds directly on the Assignment 1.2 submission above — the
+`Job` model, `JobCard`, `JobStatusBadge`, and `IconLine` are unchanged in
+shape. This assignment replaces the hardcoded, static job list with live
+state managed by Riverpod, and makes the filter chips from 1.2 — which
+looked interactive but did nothing — actually filter the list.
+
+**Package note:** `flutter_riverpod` currently ships as v3.x. Riverpod 3.0
+moved `StateProvider` (and `StateNotifierProvider`/`ChangeNotifierProvider`)
+out of the main `flutter_riverpod.dart` import into a separate
+`flutter_riverpod/legacy.dart` import — they're fully supported, just no
+longer part of the "main" API in favour of `Notifier`/`AsyncNotifier`. Every
+file below that uses `StateProvider` imports both.
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — `ref.watch` versus `ref.read`
+
+`ref.watch` and `ref.read` exist as two separate methods because they serve
+two fundamentally different jobs, and conflating them breaks the one
+guarantee Riverpod is built around: that the widget tree always reflects
+current state without anyone manually telling it to rebuild. `ref.watch`,
+called inside `build()`, subscribes the calling widget to a provider — it
+registers that widget as a listener, so that the *next* time the provider's
+value changes, Riverpod marks that widget dirty and Flutter re-runs
+`build()` for it automatically. That subscription is what "reactive" means
+here: the UI updates itself because it's continuously listening, not
+because something told it to. Calling `ref.watch` inside `onSelected` is
+inappropriate because a callback isn't a build method — it runs exactly
+once, at the moment of the tap, and is never re-run when a provider changes
+later, so creating a subscription there is meaningless at best (there's
+nothing left to redraw once the callback body finishes executing) and a
+leaked listener at worst. `ref.read`, by contrast, does a one-off lookup: it
+returns whatever the provider's value happens to be *right now*, with no
+subscription attached — exactly right inside `onSelected`, where a single
+tap just needs to grab the filter notifier once and command it to change
+state. `ref.read` is insufficient inside `build()` for the mirror-image
+reason: because it doesn't subscribe, the widget has no way of knowing the
+provider ever changed, so it renders correctly exactly once — using
+whatever the value was on that first build — and then silently freezes. If
+I had gotten this backwards, a user tapping a different filter chip would
+see the tapped chip fail to visually highlight and the job list stay
+exactly as it was, because `HomeScreen` used `ref.read` in `build()` and
+never rebuilt — the app would look broken with no error message and no
+crash, just stale UI standing still while the state underneath it quietly
+changed.
+
+### Question 2 — Choosing the right provider for each piece of state
+
+| Data | Provider type | Justification |
+|---|---|---|
+| Full job list (async fetch) | `FutureProvider<List<Job>>` | The data is fetched once, so Riverpod's job is just to represent that fetch's three states (loading/error/data) for us — `FutureProvider` wraps the result in `AsyncValue` automatically, with no hand-rolled loading flags or nullable error fields, and `ref.invalidate` is all "retry" needs, so a heavier `AsyncNotifier` buys nothing extra here. |
+| Selected filter chip label | `StateProvider<String>` | A single, simple, directly-overwritable value — every tap just replaces the old label with the new one outright, with no async work and no derivation involved, which is exactly the case `StateProvider` exists for. |
+| Filtered job list (derived) | `Provider<AsyncValue<List<Job>>>` | Nothing ever sets this value directly — it's a pure computation over the two providers above, so a plain `Provider` is correct: Riverpod recomputes it automatically the instant either input changes, and it can never be told to hold a stale value because it has no settable state of its own. |
+
+*(The brief describes the jobs provider loosely as a "notifier" — CareerHub's
+version is a `FutureProvider`, whose callback plays that same role, producing
+the async value Riverpod watches, without the ceremony of a full
+`AsyncNotifier` class. The natural next step, if CareerHub later needs
+mutating operations beyond re-fetching the whole list — e.g. marking a single
+job as saved without refetching everything — would be to promote it to an
+`AsyncNotifier`.)*
+
+**The manual-sync bug:** Storing the filtered list in its own
+`StateProvider<List<Job>>` and updating it by hand introduces a **stale-state
+(cache-invalidation) bug** — the same category as a cache that's never told
+to invalidate. The moment there are two independently-stored copies of what
+is really one derived fact, keeping them in sync stops being something the
+framework guarantees and becomes something a person has to remember to do
+correctly at every call site that touches either input. Concretely in
+CareerHub: picture a later change that adds a fifth filter chip,
+'Internship', with its own `onSelected` handler. If that handler correctly
+updates `selectedFilterProvider` but the developer forgets to also manually
+recompute and push a new value into the hand-rolled filtered-list provider,
+tapping 'Internship' would visually select the chip — but the job list
+underneath would keep showing whatever the *previous* filter produced.
+There's no crash, no red error screen, no console warning: just quietly
+wrong data on screen, which is the most expensive kind of bug to find
+because nothing about running the app points you toward where it's coming
+from.
+
+### Question 3 — `AsyncValue` and the UI contract
+
+| `AsyncValue` state | What renders | Why it respects the user |
+|---|---|---|
+| `loading` | A centred `CircularProgressIndicator` | Immediately confirms the app is doing *something* — silence during a network call reads as a frozen or broken app, not a fast one. |
+| `error` | An icon, a short message, and a retry button | Honest that something failed rather than quietly showing an empty list that looks like "there are simply no jobs," and hands the user an immediate way to recover without force-closing the app. |
+| `data` | The job list/grid, via the existing `LayoutBuilder` logic | The successful case CareerHub exists for — gets exactly the responsive UI Assignment 1.2 already built, with no extra wrapping. |
+
+**The fourth condition:** within `data`, the resulting list can be **empty**
+— loaded successfully, but zero jobs match the currently selected filter.
+Forgetting this means the user sees a blank scrollable area with no cards
+and no text, which looks identical to a rendering bug or a frozen app and
+gives no hint that the real cause is just an overly narrow filter. Handled
+with an explicit `jobs.isEmpty` check inside the `data` branch, before
+handing the list to `LayoutBuilder`, rendering the existing
+`EmptyJobsWidget` — extended this assignment with optional copy — with
+filter-specific text ("No jobs match this filter — try a different filter
+to see more listings") instead of its original "no jobs at all" message.
+
+### Question 4 — What the test was about to break, and why
+
+**Failure mode 1 — missing `ProviderScope` (architecture change).**
+`HomeScreen` (and the filter chip row) are now `ConsumerWidget`s that call
+`ref.watch`/`ref.read`, which require a `ProviderScope` ancestor to supply
+the provider container. The existing test called
+`tester.pumpWidget(const CareerHubApp())` directly — it never goes through
+`main()`, which is the only place `ProviderScope` was added — so in the
+test tree there is no `ProviderScope` ancestor, and Riverpod throws as soon
+as `HomeScreen` tries to watch anything.
+**Fix:** every test that pumps `CareerHubApp` now wraps it —
+`tester.pumpWidget(const ProviderScope(child: CareerHubApp()))`.
+
+**Failure mode 2 — async timing (fake-async).** `jobsProvider` now spends
+its first ~1.5 simulated seconds in the `loading` state, produced by a real
+`Future.delayed`. Immediately after `pumpWidget()`, only one frame has been
+built, and at that point `filteredJobsProvider` is still `AsyncLoading` — so
+the body shows the spinner, not any `JobCard`s. Any assertion that looks for
+job text (e.g. `find.text('Senior Flutter Developer')`) runs before that
+Future ever resolves and fails, because that text was never built. Left
+unresolved, the pending `Future.delayed` timer can also be reported as a
+leaked `Timer` when the test tears down.
+**Fix:** explicitly advance the tester's fake clock past the delay before
+asserting on job data — `await tester.pump()` to build the loading frame,
+then `await tester.pump(const Duration(seconds: 2))` to jump the fake clock
+past the 1.5-second delay and let the pending timer resolve, before any
+card-content assertions run.
+
+---
+
+## PART 2 — PROVIDER ARCHITECTURE
+
+New file: `lib/providers/job_providers.dart`, containing all three providers
+named above, plus the mock job data (moved here from `HomeScreen`, which no
+longer has a static job list field at all).
+
+- `jobsProvider` simulates a network call with
+  `await Future.delayed(const Duration(milliseconds: 1500))` — comfortably
+  over the required 1-second minimum, and matched to the Part 3 checkpoint's
+  "spinner appears for approximately 1.5 seconds."
+- `selectedFilterProvider` defaults to `'All'`.
+- `filteredJobsProvider` filters against **real** `Job` fields only:
+  `'Remote'` checks `job.location == 'Remote'` (which `Job.remote()` stamps
+  intrinsically), and every other label checks
+  `job.employmentType == filterLabel` directly, since `'Full-time'` and
+  `'Contract'` are already the literal `employmentType` strings used
+  throughout CareerHub's mock data.
+- Confirmed against the six existing mock jobs: `'Remote'` matches 2 (DevOps
+  Engineer, Technical Support Engineer), `'Full-time'` matches 4, `'Contract'`
+  matches 2 — every filter has at least one result.
+- `runApp` in `main.dart` is now wrapped in `ProviderScope`.
+
+**Riverpod 3.0 note for later:** as of 3.0, a provider that throws is
+auto-retried by Riverpod itself (up to 10 attempts, 200ms delay doubling to
+6.4s) before `AsyncValue` ever reaches `error` — configurable via a `retry`
+parameter on `ProviderScope`. That's invisible in this submission because
+`jobsProvider` never throws here, but it matters the moment Stretch B (below)
+adds a way to make it fail: without addressing it, the manual retry button
+would appear to hang for a long time before either state actually changes.
+
+## PART 3 — WIRING THE SCREEN
+
+`HomeScreen` is now a `ConsumerWidget`. Its `build()` watches exactly one
+provider — `filteredJobsProvider` — and hands its `AsyncValue<List<Job>>` to
+`.when()`. The `LayoutBuilder` / `ListView.builder` / `GridView.builder` /
+`_buildCard` logic from Assignment 1.2 is untouched; `_buildCard` now takes
+`jobs` as an explicit parameter instead of closing over a static field,
+since that field no longer exists.
+
+The filter chip row (`_FilterChipRow`) is now its **own** `ConsumerWidget`
+rather than a plain one fed by `HomeScreen` — deliberate, not incidental.
+The brief disallows passing callback functions down through widget
+constructors, and the reason that matters is the same mechanism behind
+Question 1: a callback threaded down through a constructor is still just a
+callback, so putting `ref.watch` inside it would be exactly as meaningless
+as putting it in `onSelected` directly. Instead, `_FilterChipRow` reads and
+writes `selectedFilterProvider` itself — `HomeScreen` never even needs to
+know that provider exists.
+
+An error path was added — an icon, a short generic message ("We couldn't
+load the job listings. Please try again."), and a `FilledButton` that calls
+`ref.invalidate(jobsProvider)`. CareerHub's mock data never actually fails
+in this submission (no failure hook exists yet — that's Stretch B), so this
+path is exercised structurally but not currently reachable through normal
+use.
+
+`EmptyJobsWidget` (Assignment 1.1/1.2) was extended with optional `icon`,
+`title`, and `message` parameters, defaulting to its original 1.1 copy so
+nothing about its previous behaviour changed. It's now reused for the
+fourth `AsyncValue` condition from Question 3 — an empty *filtered* result —
+with filter-specific copy instead of its original "no jobs at all" message.
+
+## PART 4 — TEST UPDATES
+
+Both Question 4 fixes are applied via a single shared helper,
+`pumpLoadedApp()`, used by every test that renders the full app:
+
+```dart
+Future<void> pumpLoadedApp(WidgetTester tester) async {
+  await tester.pumpWidget(const ProviderScope(child: CareerHubApp()));
+  await tester.pump(); // build the first (loading) frame
+  await tester.pump(const Duration(seconds: 2)); // resolve the 1.5s delay
+}
+```
+
+Two new tests were added under **Async Loading State**, directly covering
+the submission checklist's "`CircularProgressIndicator` assertion present
+for loading state" item: one confirms the spinner is present and no
+`JobCard`s exist immediately after the first pump, the other confirms the
+spinner is gone and cards exist once the fake clock has been advanced past
+the delay. A **Reactive Filtering** group was also added, tapping the
+"Remote" and "All" chips and asserting the visible cards change accordingly
+— this isn't explicitly required by the checklist, but it's the actual
+behaviour this assignment exists to build, so it felt wrong to ship a test
+suite that never exercises it.
+
+Tests that pump `JobCard`, `IconLine`, or `EmptyJobsWidget` directly (not
+through `CareerHubApp`) needed no changes — none of those widgets read
+Riverpod state, so none of them have a `ProviderScope` dependency.
+
+One pre-existing fragility was tightened while this file was already open:
+several filter-chip-label assertions used bare `find.text('Remote')` /
+`find.text('Full-time')`, which also match the *same words* rendered as a
+job's location or employment type inside a card. These now use
+`find.widgetWithText(ChoiceChip, '...')`, which can only match the chip.
+
+*(This section supersedes the old "Known pre-existing issue" note that used
+to sit here: `test/widget_test.dart` no longer references `MyApp` or a
+counter — it's been fully rewritten around `CareerHubApp` / `HomeScreen`,
+and this assignment rewrites it again for the Riverpod architecture.)*
+
+## SCREENSHOTS
+
+**Loading state (spinner, ~1.5s after launch):**
+
+![Loading state](screenshots/loading.png)
+
+**Filtered state ("Remote" selected — only matching jobs shown):**
+
+![Filtered state](screenshots/filtered.png)
+
+**All filter restored (full list showing again):**
+
+![All filter restored](screenshots/all.png)
+
+---
+
+## STRETCH GOALS
+
+Not attempted in this submission — flagged here so the checklist above
+isn't mistaken for silently skipped work. All three build directly on the
+architecture above without touching `HomeScreen`'s core logic again:
+
+- **Stretch A — second filter dimension (sort order):** a second
+  `StateProvider` for sort order, composed into a new derived provider that
+  watches all three (`jobsProvider`, `selectedFilterProvider`, the new sort
+  provider). `HomeScreen` would keep watching only that single final derived
+  provider — unchanged from how it watches `filteredJobsProvider` today.
+- **Stretch B — simulated error state:** a
+  `shouldFailProvider = StateProvider<bool>((ref) => false)`, read inside
+  `jobsProvider` to `throw` on demand, toggled by a new `AppBar` icon button
+  that also calls `ref.invalidate(jobsProvider)`. This is what would make
+  the error state (already built in Part 3) actually reachable through the
+  running app — and where the Riverpod 3.0 auto-retry note above becomes
+  worth addressing.
+- **Stretch C — search field:** requires `HomeScreen` to become a
+  `ConsumerStatefulWidget` specifically to own a `TextEditingController`'s
+  lifecycle, plus a third derived provider watching jobs, filter, and search
+  query together.
