@@ -817,3 +817,401 @@ and `_FailToggleButton` in this codebase. Making any of those
 `createState()` boilerplate for zero benefit, and would mislead the next
 reader into thinking the widget owns some meaningful local state, when in
 reality all of its real state already lives correctly in a provider.
+
+---
+---
+
+# CareerHub — Assignment 1.4: Deep Navigation & Route Architecture
+
+Week 1, Day 4. Builds directly on the Assignment 1.3 submission above — the
+reactive provider graph, filter chips, loading/error states and all three
+1.3 stretch goals are unchanged. This assignment adds **URL-based
+navigation** with `go_router`: two persistent tabs, a job detail screen with
+a stable URL, and correct back-button behaviour.
+
+*Written decisions completed 2026-07-15, before any router code was written.*
+
+> **Repo housekeeping done as part of 1.4:** the package was named
+> `careerhub` in `pubspec.yaml` while every test imported
+> `package:careerhub_mobile/...`, so the suite could not compile. The package
+> is now named `careerhub_mobile` to match the folder and the imports, which
+> is what lets Part 4's `flutter test` run at all.
+
+---
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — The route tree
+
+Every node below shows its **path**, the **screen** it renders, and whether
+it sits **inside** the `StatefulShellRoute.indexedStack` (NavigationBar
+visible) or **outside** it (full screen, no NavigationBar).
+
+```
+ROUTE TREE                                         SCREEN               SHELL?
+────────────────────────────────────────────────────────────────────────────
+/login                                             LoginScreen          OUTSIDE
+                                                                        (full screen,
+                                                                         no nav bar)
+
+StatefulShellRoute.indexedStack  ───────────────►  ScaffoldWithNavBar   (the shell
+                                                    (hosts NavigationBar) itself)
+│
+├─ Branch 0 — Jobs
+│   └─ /jobs                                       HomeScreen           INSIDE
+│       └─ /jobs/:id                               JobDetailScreen      INSIDE
+│                                                                       (nested in
+│                                                                        the Jobs branch)
+│
+└─ Branch 1 — Saved
+    └─ /saved                                      SavedScreen          INSIDE
+```
+
+Initial location: **`/jobs`** (the Jobs tab root). The Stretch-C auth
+redirect layers on top of this — see below.
+
+**Is the detail screen inside or outside the shell? Justification.**
+It is **inside** the shell — the NavigationBar stays visible while reading a
+job, and the detail route is nested *inside the Jobs branch*, not as a
+top-level route. The user experience demands this: a job seeker who opens a
+listing should still be able to jump to their Saved tab without first backing
+out, and should be able to return to exactly where they were. Nesting the
+detail inside the branch is also what makes tab-state preservation possible
+at all — the branch's Navigator holds `[/jobs, /jobs/:id]` and
+`indexedStack` keeps that whole stack alive when the user switches tabs.
+
+**Real app that does the equivalent thing: LinkedIn.** When you tap a job in
+LinkedIn's Jobs tab, the job detail opens *with the bottom navigation bar
+still visible* — you can hop to Messaging or My Network and come straight
+back to the job you were reading. Instagram behaves identically when you open
+a post from the feed. CareerHub matches that expectation exactly.
+
+**What URL is active when the user first opens the app?**
+The router's `initialLocation` is `/jobs`. Because Stretch C ships an auth
+gate whose `isLoggedInProvider` defaults to `false`, the redirect sends a
+brand-new (signed-out) user to **`/login`** first; the instant they log in,
+the redirect re-runs and they land on **`/jobs`**. (Without Stretch C, the
+very first URL would simply be `/jobs`.)
+
+**What URL is active when reading the detail for the third job in the list?**
+`/jobs/<that job's id>` — **the id, never the position**. If the third card
+happens to be Product Designer, the URL is `/jobs/3` because its `id` is `3`,
+not because it is third. Re-sort or filter the list so a different job sits
+third, and the URL for "the third card" changes to *that* job's id. The URL
+identifies the job, not the slot.
+
+**System back button from the detail screen.** It pops the detail page off
+the Jobs branch's Navigator and returns to `/jobs` — the job list, with the
+filter/sort/search selection from Assignment 1.3 fully intact (proven in the
+screenshots below).
+
+**Back after opening `/jobs/3` directly from a notification.** Because
+`/jobs/:id` is a **child route of `/jobs`**, go_router materialises the full
+ancestor stack for that location — `[/jobs, /jobs/3]` — even when the app is
+launched cold straight onto `/jobs/3`. So pressing back pops to the **jobs
+list**, not out of the app. The user lands somewhere sensible and the route
+tree supports it precisely because the detail was nested inside the branch
+rather than declared as a sibling top-level route.
+
+### Question 2 — `context.go` vs `context.push`
+
+| Action | Method | One-sentence back-button justification |
+|---|---|---|
+| **a)** Tap a job card → detail slides in | `context.push` | The user expects back to return them to the list they came from, so the detail must be *pushed on top* and popped off by back. |
+| **b)** Tap the "Saved" tab | `goBranch` (a `go`, not a `push`) | Switching tabs must not build a back-stack entry — back should exit the app or pop within the tab, never "un-switch" the tab — so the shell swaps branches instead of pushing. |
+| **c)** "Log Out" (clear session, no path back) | `context.go('/login')` (effected via the redirect) | Log-out must leave **no** back path to authenticated screens, and `go` *replaces* the stack, so there is nothing behind `/login` for back to reveal. |
+| **d)** "Browse Similar Roles" → jobs list with a filter pre-applied | `context.go('/jobs')` | The user is heading *out* to a fresh list, so `go` resets to the list; they should not be able to "back" into the specific role they were just leaving. |
+
+**(d) — the wrong choice and what the user observes.** The wrong choice is
+**`context.push`**. Pushing the jobs list on top of the detail produces the
+stack `[jobs, detail, jobs']`. The user, now looking at "similar roles",
+presses back expecting to leave — and instead lands **back on the very
+detail screen they were trying to move on from**, with a stale second copy of
+the jobs list buried beneath it. The back button appears "stuck" on the old
+role, which is exactly the confusion `go` avoids.
+
+### Question 3 — Why IDs in URLs, not objects or indices
+
+The `Job` model had no `id`; a stable `final int id` was added and every mock
+job given a unique one (`1`–`6`). The id — not the list position — is the URL
+parameter.
+
+**What goes wrong at the product level with a position-based URL** — two
+concrete collisions where the *same index* points at *different jobs*:
+
+1. **Filter chips (Assignment 1.3).** Unfiltered and sorted A–Z, index `1` is
+   **Junior Backend Engineer**. Tap the **Remote** chip and the list becomes
+   `[DevOps Engineer, Technical Support Engineer]`, so index `1` is now
+   **Technical Support Engineer**. A URL built from position — `/jobs/1` —
+   opens a *different job* depending purely on which chip is active. Share
+   that link with "Remote" selected and the recipient, on "All", sees the
+   wrong listing.
+
+2. **Sort order (Assignment 1.3 Stretch A).** With the default A–Z sort,
+   index `0` is **DevOps Engineer**; flip to Z–A and index `0` becomes **UX
+   Researcher**. Same position, same data set, two different jobs — the URL
+   would silently change meaning the moment the user re-sorted, even though
+   nothing about the underlying listing changed.
+
+A stable `id` is immune to all of this: `/jobs/4` is DevOps Engineer under
+every filter, sort, search and scroll position, forever.
+
+**Why a position-based URL cannot support the push notification reliably.**
+The notification — "Your application to *Senior Flutter Developer* was
+reviewed. Tap to view." — must open that specific job. For a position-based
+`/jobs/<n>` to resolve correctly, *all* of the following would have to be true
+**at the exact moment the notification is tapped**: the job list is already
+fetched into memory (not a cold start, where it is empty and index `n`
+indexes into nothing); the active filter chip is the same one that was active
+when `n` was computed; the sort order is the same; the search box is empty or
+identical; and no job has been added or removed on the backend since. None of
+these can be guaranteed — a notification most often arrives while the app is
+**terminated** (so the list isn't even loaded), and even when it's warm the
+user may have left it filtered to "Contract" or sorted Z–A. The backend that
+sent the notification has no visibility into any of that client-side UI state.
+An id sidesteps every one of those preconditions: `/jobs/1` is resolved
+against the *raw, unfiltered* list the moment it loads, independent of UI
+state entirely.
+
+### Question 4 — What the test was about to break, and why
+
+**The structural change: `MaterialApp` → `MaterialApp.router`.** The widget
+tree is no longer rooted at a fixed `home:` widget that `pumpWidget` builds
+directly. Instead, GoRouter's `RouterDelegate` produces the tree from the
+current location, and the `RouteInformationParser`/delegate sit between the
+test engine and the screens. Nothing is on screen until the router **resolves
+a location** — so the test resolves the tree *through the router* now, not by
+instantiating a `home` widget.
+
+**`initialLocation` and where the test lands.** GoRouter starts at
+`initialLocation`, which is `/jobs`. That is exactly the jobs list the
+pre-router assertions (spinner, job cards, filter chips) already expect — so
+those content assertions need **no change** to *find* the list; if the router
+starts at `/jobs`, the test is already there. Two adjustments were still
+required, and neither is about the list content:
+
+- **Auth gate (Stretch C).** `isLoggedInProvider` defaults to `false`, so the
+  redirect would bounce a freshly-pumped app to `/login`. The tests override
+  it to `true` (`isLoggedInProvider.overrideWith((ref) => true)`) so they
+  exercise the authenticated `/jobs` screen the assertions were written for.
+- **New NavigationBar labels.** `Jobs` and `Saved` are new `Text` in the tree;
+  the test now asserts both destinations are visible. They were deliberately
+  chosen **not** to collide with any existing finder (they are not Job field
+  values, filter labels, or card text), so no `findsNWidgets` count elsewhere
+  needed changing *for the labels*.
+
+**One collision the fuller rendering did expose.** Now that the test surface
+is tall enough to build every card at once (the new bottom NavigationBar ate
+the vertical slack that used to leave lower cards unbuilt), `"Market-related"`
+renders **twice** — both Junior Backend Engineer and Technical Support
+Engineer disclose no salary. Those assertions moved from `findsOneWidget` to
+`findsNWidgets(2)`, which is the *correct* count for the data. The `AppBar`
+assertion stayed `findsOneWidget` because `StatefulShellRoute.indexedStack`
+builds branches lazily — the Saved branch (and its AppBar) isn't instantiated
+until first visited.
+
+---
+
+## PART 2 — MODEL & ROUTER SETUP
+
+- **`go_router: ^17.3.0`** added via `flutter pub add go_router`.
+- **`Job.id`** — a `final int id`, required by all three constructors
+  (default, `.closed`, `.remote`), threaded through `copyWith` and
+  `toString`. All six mock jobs carry unique ids `1`–`6`, assigned explicitly
+  (never derived from list position).
+- **`lib/router/app_router.dart`** — `goRouterProvider`, a Riverpod
+  `Provider<GoRouter>` so the router can read providers and be torn down
+  cleanly in tests. It uses `StatefulShellRoute.indexedStack`,
+  `initialLocation: '/jobs'`, the Jobs branch with the nested `/jobs/:id`
+  child, and the Saved branch. Path strings live in one `AppRoutes` holder.
+- **`lib/widgets/scaffold_with_nav_bar.dart`** — `ScaffoldWithNavBar`, a
+  **StatelessWidget** whose `NavigationBar.selectedIndex` comes from
+  `navigationShell.currentIndex` (the router), never from local/`StatefulWidget`
+  state. Tapping the active tab calls
+  `goBranch(index, initialLocation: index == navigationShell.currentIndex)` —
+  resetting that branch's stack (see Stretch A).
+
+*Checkpoint met:* two tabs appear, switching works, and the 1.3 jobs list
+with filter chips behaves exactly as before.
+
+---
+
+## PART 3 — JOB DETAIL SCREEN & NAVIGATION
+
+`lib/screens/job_detail_screen.dart` — `JobDetailScreen`:
+
+- Receives an `int? jobId` **extracted from the URL path parameter** (parsed
+  with `int.tryParse` in the router), never a `Job` injected via constructor.
+- **Watches the raw, unfiltered `jobsProvider`** (not `filteredJobsProvider`
+  / `visibleJobsProvider`), with an in-code comment explaining why: *a job's
+  identity must not depend on whether it currently passes the list screen's
+  active filter/search — `/jobs/3` has to resolve even when the "Remote" chip
+  is hiding job 3 from the list.*
+- Handles all three `AsyncValue` states (loading spinner, error + retry,
+  data).
+- Handles an **invalid id gracefully** — a `null` id or an id matching no job
+  renders a friendly "Job not found" screen, never a crash
+  (`firstWhere`-free lookup returning `null`).
+- Displays **every meaningful field**: title, open/closed badge, company,
+  location, employment type, salary (via `displaySalary`), closing date,
+  the derived apply/closed state, the listing id, and the full description.
+
+Job cards are now tappable: `_buildCard` wraps `JobCard` in an `InkWell` that
+calls `context.push(AppRoutes.jobDetail(job.id))` — **`job.id`, never the
+card index**. `main.dart` switched to `MaterialApp.router` (reading
+`goRouterProvider`) and **`home:` was removed**; `CareerHubApp` became a
+`ConsumerWidget` to read the router.
+
+---
+
+## PART 4 — TEST UPDATES
+
+`test/widget_test.dart` — all fixes from Q4 applied; **`flutter test`
+reports all tests passed (25/25)** and `flutter analyze` is clean.
+
+- Every pump goes through a `bootApp()` helper that wraps `CareerHubApp` in a
+  `ProviderScope` overriding `isLoggedInProvider` to `true` (past the auth
+  redirect) — the MaterialApp.router adaptation.
+- A new test asserts the **NavigationBar** and both destination labels
+  (`Jobs`, `Saved`) are visible after load.
+- `"Market-related"` assertions corrected to `findsNWidgets(2)` (two
+  no-salary jobs) — the label-count collision from Q4.
+- Loading-spinner assertion retained; all job-card data assertions retained.
+- Deprecated `window.physicalSizeTestValue` calls replaced with the modern
+  `tester.view.physicalSize` API inside a `pumpLoadedApp` helper that sets a
+  tall single-column surface, so every card builds (the new bottom nav had
+  been pushing lower cards out of the lazy-build window). The sort-order test
+  opts into an 800px two-column grid surface, since it reasons about
+  horizontal position.
+
+---
+
+## SCREENSHOTS (Assignment 1.4)
+
+> These were captured from the running app (`flutter run`, iPhone-sized
+> viewport). To regenerate: run the app, sign in, and follow each caption.
+
+**Loading state — spinner visible before data loads:**
+
+![Loading state](screenshots/1_4_loading.png)
+
+**Detail screen — one job's full details rendered (`/jobs/4`, DevOps Engineer):**
+
+![Job detail screen](screenshots/1_4_detail.png)
+
+**Filter preserved on return from detail** — select **Remote**, tap a card,
+press back, confirm the **Remote** chip is *still selected*:
+
+1. Remote filter active, list narrowed to the two remote jobs:
+
+   ![Remote filter active](screenshots/1_4_filter_before.png)
+
+2. After tapping a card → back: the **Remote** chip is still selected and the
+   list is unchanged:
+
+   ![Filter preserved after back](screenshots/1_4_filter_preserved.png)
+
+**Tab-state preservation sequence** — three screenshots:
+
+1. On a job's detail screen (NavigationBar still visible):
+
+   ![On detail, in shell](screenshots/1_4_tab_1_on_detail.png)
+
+2. Switched to the **Saved** tab:
+
+   ![Switched to Saved](screenshots/1_4_tab_2_saved.png)
+
+3. Switched back to the **Jobs** tab — the detail screen is still there and
+   its back button still returns to the list:
+
+   ![Back on Jobs, detail preserved](screenshots/1_4_tab_3_back_on_jobs.png)
+
+---
+
+## STRETCH GOALS (Assignment 1.4)
+
+### Stretch A — Active tab resets on double-tap
+
+Implemented in `ScaffoldWithNavBar._onDestinationSelected` via
+`navigationShell.goBranch(index, initialLocation: index == navigationShell.currentIndex)`.
+
+**What is `initialLocation: true` telling GoRouter to do?** It tells
+`goBranch` to reset the target branch back to its **initial/root location**
+(here, `/jobs`), discarding whatever was stacked on that branch's Navigator —
+so a detail screen sitting on top of the Jobs tab is popped and the user is
+returned to the list root. With `initialLocation: false` (the default),
+`goBranch` instead **preserves** that branch's existing stack.
+
+**How does `index == navigationShell.currentIndex` produce the behaviour?**
+That comparison is `true` only when the user taps the tab they are **already
+on** (a "double-tap"), and `false` when they tap a *different* tab. Passing it
+straight into `initialLocation` means: tapping the current tab resets it to
+root (Instagram's home-button-scrolls-to-top-and-resets behaviour), while
+tapping another tab switches without disturbing that tab's saved stack.
+
+*Screenshots — deep in the Jobs tab, then after double-tapping the Jobs icon:*
+
+![Deep in Jobs tab (on detail)](screenshots/1_4_stretchA_deep.png)
+![After double-tap — reset to list root](screenshots/1_4_stretchA_reset.png)
+
+### Stretch B — Direct navigation by ID
+
+A **notification** IconButton (`Icons.notifications_outlined`) in the jobs
+AppBar calls `context.go(AppRoutes.jobDetail(3))` — jumping straight to
+`/jobs/3`, bypassing the card tap entirely, simulating a push-notification
+deep link.
+
+**What does this test about the architecture that tapping a card does not?**
+A card tap always originates from a job that is *currently on screen* in the
+list — so the detail screen could, in principle, get away with reading the
+filtered list. `context.go('/jobs/3')` fires with **no such guarantee**: job
+3 (Product Designer, a *Contract* role) is filtered *out* while "Remote" is
+selected, the list may be scrolled anywhere, and another tab may have been
+active. It proves the detail screen can render a job **from an id alone**,
+independent of all list UI state — the exact property a real notification
+needs.
+
+**What would break if the detail relied on the filtered provider?** With
+"Remote" active, `filteredJobsProvider` does not contain job 3 at all, so the
+lookup would fail and the screen would show "Job not found" (or crash on a
+naive `firstWhere`) — the deep link would be dead precisely when it matters.
+Watching the **raw** `jobsProvider` is what makes `/jobs/3` resolve every
+time. *(Verified live: with the Remote filter on, the bell still opens
+Product Designer correctly.)*
+
+### Stretch C — Auth redirect
+
+- **`isLoggedInProvider = StateProvider<bool>((ref) => false)`**.
+- A `redirect` callback on the `GoRouter` returns `/login` for unauthenticated
+  users (and `null` — allow — otherwise; plus `/jobs` if an already-logged-in
+  user hits `/login`).
+- A minimal **`/login`** screen (`LoginScreen`, outside the shell) with a
+  single **Log In** button whose only action is
+  `ref.read(isLoggedInProvider.notifier).state = true`.
+- The provider is bridged to GoRouter via **`refreshListenable`**: the
+  `goRouterProvider` creates a `ValueNotifier<bool>` and `ref.listen`s
+  `isLoggedInProvider` into it, so flipping the provider fires the notifier
+  and re-runs `redirect`.
+
+**Why does this mean you never call `context.go('/login')` from a sign-out
+button?** Because the redirect is *declarative and centralised*: a sign-out
+button only needs to set `isLoggedInProvider = false`. `refreshListenable`
+then re-runs `redirect`, which — seeing the user is no longer authenticated —
+sends them to `/login` on its own. Navigation becomes a *consequence* of auth
+state, not something each button has to imperatively perform (and possibly
+forget).
+
+**What is `refreshListenable` doing, and why is Riverpod well-suited?**
+`refreshListenable` takes any `Listenable`; whenever it notifies, GoRouter
+re-evaluates its `redirect` against the current location. Riverpod fits this
+connection cleanly because `ref.listen` gives a first-class way to observe a
+provider and forward its changes into a `ValueNotifier`, with `ref.onDispose`
+handling teardown — so the auth *source of truth* stays a normal Riverpod
+provider (readable, overridable in tests, composable) while GoRouter consumes
+it through the one small `Listenable` adapter it understands.
+
+*Screenshots — the login screen, then the jobs list reached automatically
+after tapping Log In (no `context.go` in the login screen):*
+
+![Login screen](screenshots/1_4_stretchC_login.png)
+![Auto-redirected to jobs after login](screenshots/1_4_stretchC_after_login.png)

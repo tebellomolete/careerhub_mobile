@@ -5,6 +5,18 @@
 /// class gains a `Job.fromJson()` constructor and the shape must not
 /// change, so the nullability and typing decisions are locked in now.
 class Job {
+  /// A stable, unique identifier for this listing (Assignment 1.4).
+  ///
+  /// This is the ONLY thing a URL like `/jobs/3` is allowed to key on. It
+  /// is deliberately NOT the job's position in any list: a list index is a
+  /// property of *how the data is currently displayed* (which filter is
+  /// active, which sort order, how far the user has scrolled), whereas the
+  /// URL must identify *which job* regardless of display state — so that a
+  /// push notification, a shared link, or a back-button restore all resolve
+  /// to the same listing forever. See README Q3. In Week 2 this maps
+  /// directly onto the primary key the backend already assigns.
+  final int id;
+
   /// A listing must have a title — a job with no title is not a job a
   /// seeker could ever meaningfully browse or apply to.
   final String title;
@@ -41,6 +53,7 @@ class Job {
   /// Default constructor. Used for a standard, active listing where the
   /// employer supplies whatever fields they have.
   const Job({
+    required this.id,
     required this.title,
     required this.company,
     required this.location,
@@ -58,6 +71,7 @@ class Job {
   /// locked against new applications — a state the default constructor
   /// cannot guarantee because it defaults isOpen to true.
   const Job.closed({
+    required this.id,
     required this.title,
     required this.company,
     required this.location,
@@ -74,6 +88,7 @@ class Job {
   /// stamps location as "Remote" as an intrinsic property of the state —
   /// something the default constructor cannot encapsulate on its own.
   const Job.remote({
+    required this.id,
     required this.title,
     required this.company,
     this.salary,
@@ -101,7 +116,7 @@ class Job {
 
   @override
   String toString() {
-    return 'Job(title: $title, company: $company, location: $location, '
+    return 'Job(id: $id, title: $title, company: $company, location: $location, '
         'salary: ${salary ?? '—'}, employmentType: $employmentType, '
         'closingDate: ${closingDate?.toIso8601String() ?? '—'}, '
         'isOpen: $isOpen, canApply: $canApply)';
@@ -117,6 +132,7 @@ class Job {
   /// nullable, copyWith cannot distinguish "leave unchanged" from "set to
   /// null" without sentinels — freezed solves this properly later.
   Job copyWith({
+    int? id,
     String? title,
     String? company,
     String? location,
@@ -127,6 +143,7 @@ class Job {
     bool? isOpen,
   }) {
     return Job(
+      id: id ?? this.id,
       title: title ?? this.title,
       company: company ?? this.company,
       location: location ?? this.location,

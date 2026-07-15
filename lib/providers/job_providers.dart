@@ -13,7 +13,7 @@ import '../models/job.dart';
 /// FutureProvider is the right tool here: this data is fetched once
 /// (simulating a network round-trip), and Riverpod's job is to represent
 /// the three states of that fetch — loading, error, data — for us.
-/// FutureProvider wraps its result in AsyncValue<List<Job>> automatically,
+/// FutureProvider wraps its result in `AsyncValue<List<Job>>` automatically,
 /// so nothing else in the app hand-rolls a loading flag or a nullable
 /// error field. "Retry" is just `ref.invalidate(jobsProvider)`, which
 /// FutureProvider already supports — reaching for the heavier
@@ -160,6 +160,35 @@ final visibleJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
   });
 });
 
+/// ---------------------------------------------------------------------
+/// Assignment 1.4 — the set of job ids the user has saved.
+///
+/// Backs the "Saved" NavigationBar tab. A `Set<int>` of ids (not a
+/// `List<Job>`) for the same reason the URL keys on id: the saved state
+/// must survive re-fetches of the job list and never pin a stale copy of
+/// a job's fields.
+/// ---------------------------------------------------------------------
+final savedJobIdsProvider = StateProvider<Set<int>>((ref) => <int>{});
+
+/// The saved jobs as a derived list, resolved against the raw job list.
+final savedJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
+  final jobsAsync = ref.watch(jobsProvider);
+  final savedIds = ref.watch(savedJobIdsProvider);
+  return jobsAsync.whenData(
+    (jobs) => jobs.where((job) => savedIds.contains(job.id)).toList(),
+  );
+});
+
+/// ---------------------------------------------------------------------
+/// Stretch C — authentication state.
+///
+/// A single boolean the GoRouter redirect reads to decide whether to send
+/// the user to /login. Defaults to false: out of the box the app opens on
+/// the login screen. See README Stretch C for how refreshListenable turns
+/// a change here into an automatic redirect with no context.go() call.
+/// ---------------------------------------------------------------------
+final isLoggedInProvider = StateProvider<bool>((ref) => false);
+
 /// The mock "backend" data — moved here from HomeScreen (Assignment 1.3
 /// Part 2: "Job data is no longer a field on HomeScreen"). Unchanged
 /// from Assignment 1.2: same six jobs, same edge cases.
@@ -170,8 +199,14 @@ final visibleJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
 ///   Full-time  -> Senior Flutter Developer, Junior Backend
 ///                 Engineer, DevOps Engineer, UX Researcher      (4)
 ///   Contract   -> Product Designer, Technical Support Engineer  (2)
+/// IDs are assigned explicitly and are stable — they are NOT the list
+/// position. The list happens to be authored in id order here, but nothing
+/// downstream may assume that: filtering, sorting and searching all reorder
+/// this list, and only `job.id` survives those transformations intact. This
+/// is the invariant that makes `/jobs/:id` reliable (README Q3).
 final List<Job> _mockJobs = [
   Job(
+    id: 1,
     title: 'Senior Flutter Developer',
     company: 'Bitcube',
     location: 'Cape Town, ZA',
@@ -184,6 +219,7 @@ final List<Job> _mockJobs = [
     isOpen: true,
   ),
   Job(
+    id: 2,
     title: 'Junior Backend Engineer',
     company: 'Nimbus Systems',
     location: 'Johannesburg, ZA',
@@ -191,6 +227,7 @@ final List<Job> _mockJobs = [
     isOpen: true,
   ),
   Job.closed(
+    id: 3,
     title: 'Product Designer',
     company: 'Loop Studio',
     location: 'Durban, ZA',
@@ -200,6 +237,7 @@ final List<Job> _mockJobs = [
     description: 'This role has closed for new applications.',
   ),
   Job.remote(
+    id: 4,
     title: 'DevOps Engineer',
     company: 'Skyforge',
     salary: 'R60 000 – R80 000 per month',
@@ -209,6 +247,7 @@ final List<Job> _mockJobs = [
     isOpen: true,
   ),
   Job(
+    id: 5,
     title: 'UX Researcher',
     company: 'Meridian Labs',
     location: 'Pretoria, ZA',
@@ -221,6 +260,7 @@ final List<Job> _mockJobs = [
     isOpen: true,
   ),
   Job.remote(
+    id: 6,
     title: 'Technical Support Engineer',
     company: 'Fathom Analytics',
     employmentType: 'Contract',

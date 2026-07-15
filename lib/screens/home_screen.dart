@@ -1,12 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-// Needed for .notifier/.state on the StateProviders below — see the note
-// in job_providers.dart on why StateProvider needs this import as of
-// Riverpod 3.0.
-import 'package:flutter_riverpod/legacy.dart';
+import 'package:go_router/go_router.dart';
 
 import '../models/job.dart';
 import '../providers/job_providers.dart';
+import '../router/app_router.dart';
 import '../widgets/job_card.dart';
 import '../widgets/empty_jobs_widget.dart';
 
@@ -73,10 +71,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       appBar: AppBar(
         title: const Text('CareerHub'),
         centerTitle: false,
-        actions: const [
-          _SortButton(),
-          _FailToggleButton(),
-          SizedBox(width: 4),
+        actions: [
+          // Assignment 1.4 added a third action (the notification simulator),
+          // which overflows the AppBar's trailing slot on a ~400px-wide phone
+          // at the default 48px tap target. Shrink-wrapping the tap targets
+          // and using compact density keeps all three icons within the slot
+          // on narrow devices without hiding any behind an overflow menu (the
+          // 1.3 tests tap these icons directly).
+          Theme(
+            data: Theme.of(context).copyWith(
+              iconButtonTheme: IconButtonThemeData(
+                style: IconButton.styleFrom(
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _SimulateNotificationButton(),
+                _SortButton(),
+                _FailToggleButton(),
+                SizedBox(width: 4),
+              ],
+            ),
+          ),
         ],
       ),
       body: Column(
@@ -180,8 +200,37 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   /// so ListView.builder and GridView.builder never duplicate itemBuilder
   /// logic. It now takes `jobs` explicitly since there's no static field
   /// left to close over.
+  ///
+  /// Assignment 1.4: the card is now tappable. It navigates with
+  /// `job.id` — NEVER `index` — via context.push, so the detail screen
+  /// slides in over the list and the back button returns here with the
+  /// filter/sort/search state untouched. Using `index` here would be the
+  /// exact bug README Q3 warns about: the same index means different jobs
+  /// under different filters.
   static Widget _buildCard(BuildContext context, int index, List<Job> jobs) {
-    return JobCard(job: jobs[index]);
+    final job = jobs[index];
+    return InkWell(
+      onTap: () => context.push(AppRoutes.jobDetail(job.id)),
+      child: JobCard(job: job),
+    );
+  }
+}
+
+/// Stretch B — simulates a push notification tap. A notification IS a URL:
+/// this button jumps straight to /jobs/3 with context.go, bypassing the
+/// card tap entirely, proving the detail screen can render from an id alone
+/// regardless of the list's filter, scroll, or which tab was last active.
+/// See README Stretch B.
+class _SimulateNotificationButton extends StatelessWidget {
+  const _SimulateNotificationButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      icon: const Icon(Icons.notifications_outlined),
+      tooltip: 'Simulate a notification for job #3',
+      onPressed: () => context.go(AppRoutes.jobDetail(3)),
+    );
   }
 }
 

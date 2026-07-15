@@ -3,28 +3,64 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:careerhub_mobile/main.dart';
 import 'package:careerhub_mobile/models/job.dart';
+import 'package:careerhub_mobile/providers/job_providers.dart';
 import 'package:careerhub_mobile/widgets/job_card.dart';
 import 'package:careerhub_mobile/widgets/icon_line.dart';
 import 'package:careerhub_mobile/widgets/empty_jobs_widget.dart';
 
-/// Assignment 1.3, Question 4 — fixes both failure modes in one place.
+/// Assignment 1.4, Question 4 — the structural test change.
 ///
-/// Failure mode 1 (architecture): HomeScreen and its filter chip row are
-/// now Consumer(Stateful)Widgets, which require a ProviderScope ancestor.
-/// Pumping CareerHubApp bare (as the old tests did) never goes through
-/// main() — where ProviderScope is added — so it throws. Fixed by
-/// wrapping every pump of CareerHubApp in ProviderScope here.
+/// The app is now MaterialApp.router, not MaterialApp with `home:`. That
+/// changes how the widget tree is resolved: instead of the test engine
+/// building a fixed `home` widget, GoRouter's RouterDelegate now decides
+/// what to build from `initialLocation`. Nothing is on screen until the
+/// router resolves a location. Our initialLocation is `/jobs`, so the app
+/// lands on the jobs list exactly where the pre-router assertions expect —
+/// so the job/spinner/chip assertions below need no rewriting for content,
+/// only the wrapper below.
 ///
-/// Failure mode 2 (async timing): jobsProvider now spends its first
-/// ~1.5 simulated seconds in the `loading` state via a real
-/// Future.delayed. Asserting on job text immediately after pumpWidget()
-/// fails, because that text hasn't been built yet — and if a test ends
-/// before the delay resolves, flutter_test can report the still-pending
-/// Timer as leaked. Fixed with an explicit, deterministic time jump
-/// (`pump(duration)`) past the delay, rather than relying on
-/// pumpAndSettle().
-Future<void> pumpLoadedApp(WidgetTester tester) async {
-  await tester.pumpWidget(const ProviderScope(child: CareerHubApp()));
+/// The one thing initialLocation alone can't satisfy is Stretch C's auth
+/// gate: isLoggedInProvider defaults to false, so the redirect would send a
+/// freshly-pumped app to /login instead of /jobs. Tests override it to true
+/// so we exercise the authenticated app the assertions were written for.
+///
+/// Assignment 1.3's two fixes still apply and are unchanged in spirit:
+///  - ProviderScope wrapper (Consumer widgets need the ancestor), and
+///  - a deterministic time jump past jobsProvider's ~1.5s Future.delayed
+///    rather than pumpAndSettle().
+Widget bootApp() {
+  return ProviderScope(
+    // Stretch C: start authenticated so the redirect allows /jobs through.
+    overrides: [isLoggedInProvider.overrideWith((ref) => true)],
+    child: const CareerHubApp(),
+  );
+}
+
+/// A tall, narrow default surface. Assignment 1.4 adds a persistent bottom
+/// NavigationBar, which eats vertical space that the job list used to have.
+/// On the small default 800x600 test surface that was enough to push the
+/// lower job cards out of the lazy-build window, so text-specific finders
+/// (e.g. find.text('Senior Flutter Developer')) saw zero matches even though
+/// the data was correct.
+///
+/// Width 500 keeps the app in the single-column ListView tier (< 600px),
+/// where each card is laid out at its natural height — so the richest cards
+/// (description + closing date) never overflow a fixed-aspect-ratio grid
+/// cell — and 3000px of height keeps all six cards built at once (dpr 1 so
+/// logical == physical). Tests that specifically need a grid tier pass their
+/// own [surface].
+const Size _defaultSurface = Size(500, 3000);
+
+Future<void> pumpLoadedApp(
+  WidgetTester tester, {
+  Size surface = _defaultSurface,
+}) async {
+  // Modern, non-deprecated viewport control (replaces window.*TestValue).
+  tester.view.physicalSize = surface;
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+
+  await tester.pumpWidget(bootApp());
   await tester.pump(); // build the first (loading) frame
   await tester.pump(const Duration(seconds: 2)); // resolve the 1.5s delay
 }
@@ -40,8 +76,26 @@ void main() {
 
     testWidgets('App bar displays on HomeScreen', (WidgetTester tester) async {
       await pumpLoadedApp(tester);
+      // Still findsOneWidget: StatefulShellRoute.indexedStack builds branches
+      // lazily, so the Saved branch (and its AppBar) is not instantiated
+      // until it is first visited — only the Jobs AppBar exists on launch.
       expect(find.byType(AppBar), findsOneWidget);
       expect(find.text('CareerHub'), findsWidgets);
+    });
+
+    testWidgets('NavigationBar with Jobs and Saved destinations is visible',
+        (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+
+      // Assignment 1.4: the persistent shell renders a NavigationBar whose
+      // two destination labels are new text in the tree. These labels were
+      // chosen to NOT collide with any existing assertion — 'Jobs' and
+      // 'Saved' are not Job field values, filter labels, or card text — so
+      // no findsNWidgets count elsewhere needed adjusting.
+      expect(find.byType(NavigationBar), findsOneWidget);
+      expect(find.widgetWithText(NavigationDestination, 'Jobs'), findsOneWidget);
+      expect(
+          find.widgetWithText(NavigationDestination, 'Saved'), findsOneWidget);
     });
 
     testWidgets('Filter chip row is present and scrollable',
@@ -63,7 +117,7 @@ void main() {
   group('Async Loading State (Assignment 1.3)', () {
     testWidgets('shows a CircularProgressIndicator before data loads',
         (WidgetTester tester) async {
-      await tester.pumpWidget(const ProviderScope(child: CareerHubApp()));
+      await tester.pumpWidget(bootApp());
       await tester.pump(); // first frame only — jobsProvider still loading
 
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
@@ -86,11 +140,8 @@ void main() {
   group('Job List Rendering', () {
     testWidgets('ListView.builder renders job cards in portrait',
         (WidgetTester tester) async {
-      // Default viewport is portrait, narrow
-      tester.binding.window.physicalSizeTestValue = const Size(400, 800);
-      addTearDown(tester.binding.window.clearPhysicalSizeTestValue);
-
-      await pumpLoadedApp(tester);
+      // Narrow (single-column ListView tier) but tall enough to build cards.
+      await pumpLoadedApp(tester, surface: const Size(400, 2000));
 
       // Six jobs total (the four from 1.1 + 2 added for Stretch B of 1.2)
       expect(find.byType(JobCard), findsWidgets);
@@ -100,15 +151,8 @@ void main() {
 
     testWidgets('All four original Job variants render correctly',
         (WidgetTester tester) async {
-      // Generous viewport: this test looks for four different jobs
-      // spread across the unfiltered six-job grid, and Assignment 1.3
-      // added a search field above the chip row, shrinking the space
-      // left for the list itself. A wide, tall surface keeps every card
-      // comfortably built without depending on how far Flutter's default
-      // list/grid cache extent happens to reach.
-      tester.binding.window.physicalSizeTestValue = const Size(1200, 2000);
-      addTearDown(tester.binding.window.clearPhysicalSizeTestValue);
-
+      // The default tall single-column surface keeps all six cards built at
+      // once, so every one of the four variant jobs below is findable.
       await pumpLoadedApp(tester);
 
       // Job 1: Fully populated
@@ -116,9 +160,13 @@ void main() {
       expect(find.text('Bitcube'), findsWidgets); // Company + multiple places
       expect(find.text('R55 000 – R75 000 per month'), findsOneWidget);
 
-      // Job 2: No salary, no closing date (uses displaySalary)
+      // Job 2: No salary, no closing date (uses displaySalary).
       expect(find.text('Junior Backend Engineer'), findsOneWidget);
-      expect(find.text('Market-related'), findsOneWidget);
+      // Two jobs disclose no salary — Junior Backend Engineer AND Technical
+      // Support Engineer — so "Market-related" renders twice now that the
+      // tall surface builds every card at once. (Pre-1.4 this passed only
+      // because the smaller grid viewport left the second card unbuilt.)
+      expect(find.text('Market-related'), findsNWidgets(2));
 
       // Job 3: Closed job
       expect(find.text('Product Designer'), findsOneWidget);
@@ -145,12 +193,13 @@ void main() {
       expect(find.text('Closed'), findsOneWidget);
     });
 
-    testWidgets('JobCard with no salary shows "Market-related"',
+    testWidgets('jobs with no salary show "Market-related"',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
-      // Job 2 has no salary and should display "Market-related"
-      expect(find.text('Market-related'), findsOneWidget);
+      // Both no-salary jobs (Junior Backend Engineer, Technical Support
+      // Engineer) display "Market-related" via displaySalary.
+      expect(find.text('Market-related'), findsNWidgets(2));
     });
   });
 
@@ -188,7 +237,11 @@ void main() {
   group('Stretch Goals (Assignment 1.3)', () {
     testWidgets('sort menu reverses job order (Stretch A)',
         (WidgetTester tester) async {
-      await pumpLoadedApp(tester);
+      // This test reasons about horizontal position (dx), so it needs the
+      // two-column GRID tier, not the single-column list. Width 800 sits in
+      // the 2-column band (600–839px) and gives cells wide enough that the
+      // richest card doesn't overflow its fixed-ratio cell.
+      await pumpLoadedApp(tester, surface: const Size(800, 1400));
 
       // Narrow to the two remote jobs so there are only two candidates
       // to reason about the order of.
@@ -256,6 +309,7 @@ void main() {
     testWidgets('JobCard renders all required fields',
         (WidgetTester tester) async {
       final testJob = Job(
+        id: 101,
         title: 'Test Developer',
         company: 'Test Corp',
         location: 'Test City',
@@ -283,6 +337,7 @@ void main() {
         (WidgetTester tester) async {
       // Job with all nullable fields absent
       final minimalJob = Job(
+        id: 102,
         title: 'Minimal Job',
         company: 'Company',
         location: 'Somewhere',
@@ -305,6 +360,7 @@ void main() {
     testWidgets('JobCard shows description when present',
         (WidgetTester tester) async {
       final jobWithDesc = Job(
+        id: 103,
         title: 'Job with Description',
         company: 'Company',
         location: 'Location',
@@ -398,6 +454,7 @@ void main() {
     testWidgets('JobCard renders correctly in light mode',
         (WidgetTester tester) async {
       final testJob = Job(
+        id: 104,
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
@@ -421,6 +478,7 @@ void main() {
     testWidgets('JobCard renders correctly in dark mode',
         (WidgetTester tester) async {
       final testJob = Job(
+        id: 105,
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
