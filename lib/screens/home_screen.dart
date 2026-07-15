@@ -34,13 +34,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   /// Stretch C.
   late final TextEditingController _searchController;
 
-  static const List<String> _filters = [
-    'All',
-    'Remote',
-    'Full-time',
-    'Contract',
-  ];
-
   static const double _gridBreakpoint = 600;
   static const double _threeColumnBreakpoint = 840;
 
@@ -129,7 +122,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ),
           ),
 
-          const _FilterChipRow(filters: _filters),
+          const _FilterDropdownRow(),
 
           Expanded(
             child: visibleJobsAsync.when(
@@ -234,45 +227,159 @@ class _SimulateNotificationButton extends StatelessWidget {
   }
 }
 
-/// The pinned, horizontally-scrolling filter row above the job
-/// list/grid.
+/// Two side-by-side dropdown filters above the job list/grid — Location
+/// and Job type — replacing the chip row from Assignments 1.2/1.3.
 ///
-/// Its own ConsumerWidget rather than a plain one fed by HomeScreen —
-/// deliberate, not incidental. The brief disallows passing callback
-/// functions down through widget constructors, and the reason that
-/// matters is the same mechanism behind README Q1: a callback threaded
-/// down through a constructor is still just a callback, so putting
-/// ref.watch inside it would be exactly as meaningless as putting it in
-/// onSelected directly. Instead, _FilterChipRow reads and writes
-/// selectedFilterProvider itself — HomeScreen never even needs to know
-/// that provider exists.
-class _FilterChipRow extends ConsumerWidget {
-  final List<String> filters;
+/// Same architectural reason it was a chip row before, still a
+/// ConsumerWidget now: each dropdown reads and writes its own provider
+/// directly. HomeScreen doesn't have to know these providers exist, so
+/// its single ref.watch call still watches only visibleJobsProvider.
+///
+/// The two dropdowns are independent — a user can pick Remote + Full-time
+/// to narrow along both dimensions at once, and null on either dropdown
+/// means "any". filteredJobsProvider composes the two.
+class _FilterDropdownRow extends StatelessWidget {
+  const _FilterDropdownRow();
 
-  const _FilterChipRow({required this.filters});
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: _FilterField(
+              label: 'Location',
+              child: _LocationFilterDropdown(),
+            ),
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: _FilterField(
+              label: 'Job type',
+              child: _JobTypeFilterDropdown(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A tiny wrapper: label above the dropdown, so the label doesn't have to
+/// share the field's horizontal space with the selected value + arrow.
+/// This keeps the two dropdowns from overflowing at narrow widths.
+class _FilterField extends StatelessWidget {
+  final String label;
+  final Widget child;
+
+  const _FilterField({required this.label, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label,
+          style: theme.textTheme.labelSmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 4),
+        child,
+      ],
+    );
+  }
+}
+
+/// Location dropdown — On-site / Remote / Hybrid, plus a null "All".
+class _LocationFilterDropdown extends ConsumerWidget {
+  const _LocationFilterDropdown();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final selectedFilter = ref.watch(selectedFilterProvider);
+    final selected = ref.watch(locationFilterProvider);
 
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: Row(
-        children: [
-          for (final filter in filters)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                label: Text(filter),
-                selected: filter == selectedFilter,
-                onSelected: (_) {
-                  ref.read(selectedFilterProvider.notifier).state = filter;
-                },
-              ),
-            ),
-        ],
+    return DropdownButtonFormField<LocationType?>(
+      // `initialValue` (not the deprecated `value`) is Flutter 3.44+ API for
+      // seeding the current selection of DropdownButtonFormField.
+      initialValue: selected,
+      // isExpanded lets the field take all available width — without it,
+      // the internal Row tries to size to its content and overflows a
+      // narrow Expanded parent.
+      isExpanded: true,
+      isDense: true,
+      decoration: InputDecoration(
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
       ),
+      // A null value is a first-class item (the "All locations" option),
+      // not a placeholder — so the Set-Notifier state is a real
+      // LocationType? that the filter provider understands directly.
+      items: const [
+        DropdownMenuItem<LocationType?>(
+          value: null,
+          child: Text('All locations'),
+        ),
+        DropdownMenuItem<LocationType?>(
+          value: LocationType.onSite,
+          child: Text('On-site'),
+        ),
+        DropdownMenuItem<LocationType?>(
+          value: LocationType.remote,
+          child: Text('Remote'),
+        ),
+        DropdownMenuItem<LocationType?>(
+          value: LocationType.hybrid,
+          child: Text('Hybrid'),
+        ),
+      ],
+      onChanged: (value) =>
+          ref.read(locationFilterProvider.notifier).state = value,
+    );
+  }
+}
+
+/// Job type dropdown — Full-time / Part-time / Contract / Internship,
+/// plus a null "All".
+class _JobTypeFilterDropdown extends ConsumerWidget {
+  const _JobTypeFilterDropdown();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final selected = ref.watch(jobTypeFilterProvider);
+
+    return DropdownButtonFormField<JobTypeFilter?>(
+      initialValue: selected,
+      isExpanded: true,
+      isDense: true,
+      decoration: InputDecoration(
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+      ),
+      items: [
+        const DropdownMenuItem<JobTypeFilter?>(
+          value: null,
+          child: Text('All types'),
+        ),
+        for (final type in JobTypeFilter.values)
+          DropdownMenuItem<JobTypeFilter?>(
+            value: type,
+            child: Text(type.label),
+          ),
+      ],
+      onChanged: (value) =>
+          ref.read(jobTypeFilterProvider.notifier).state = value,
     );
   }
 }

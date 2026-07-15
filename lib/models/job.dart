@@ -1,3 +1,12 @@
+/// How a role is performed physically. A small, closed set of categories
+/// the seeker filters by — hybrid is a first-class option (a real modern
+/// arrangement), not a derived guess about a Job's `location` string.
+enum LocationType {
+  onSite,
+  remote,
+  hybrid,
+}
+
 /// The core data entity of CareerHub.
 ///
 /// Every decision in this class — which fields are nullable, what type
@@ -29,6 +38,11 @@ class Job {
   /// always needs a location to judge fit. Required.
   final String location;
 
+  /// The physical work arrangement — on-site, remote, or hybrid. Required
+  /// so the location dropdown filter has an unambiguous truth to match on,
+  /// rather than parsing the free-text `location` string.
+  final LocationType locationType;
+
   /// An employer may choose not to disclose salary, so this is optional.
   /// See displaySalary for how the absent case is handled.
   final String? salary;
@@ -57,6 +71,7 @@ class Job {
     required this.title,
     required this.company,
     required this.location,
+    required this.locationType,
     this.salary,
     required this.employmentType,
     this.closingDate,
@@ -75,6 +90,7 @@ class Job {
     required this.title,
     required this.company,
     required this.location,
+    required this.locationType,
     this.salary,
     required this.employmentType,
     this.closingDate,
@@ -96,7 +112,8 @@ class Job {
     this.closingDate,
     this.description,
     this.isOpen = true,
-  }) : location = 'Remote';
+  })  : location = 'Remote',
+        locationType = LocationType.remote;
 
   /// True only when a JobSeeker can actually apply. The rule for what
   /// makes a job applicable lives here on the model, not in any widget.
@@ -116,7 +133,8 @@ class Job {
 
   @override
   String toString() {
-    return 'Job(id: $id, title: $title, company: $company, location: $location, '
+    return 'Job(id: $id, title: $title, company: $company, '
+        'location: $location, locationType: ${locationType.name}, '
         'salary: ${salary ?? '—'}, employmentType: $employmentType, '
         'closingDate: ${closingDate?.toIso8601String() ?? '—'}, '
         'isOpen: $isOpen, canApply: $canApply)';
@@ -136,6 +154,7 @@ class Job {
     String? title,
     String? company,
     String? location,
+    LocationType? locationType,
     String? salary,
     String? employmentType,
     DateTime? closingDate,
@@ -147,6 +166,7 @@ class Job {
       title: title ?? this.title,
       company: company ?? this.company,
       location: location ?? this.location,
+      locationType: locationType ?? this.locationType,
       salary: salary ?? this.salary,
       employmentType: employmentType ?? this.employmentType,
       closingDate: closingDate ?? this.closingDate,

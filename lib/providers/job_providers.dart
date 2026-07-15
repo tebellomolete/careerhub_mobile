@@ -59,48 +59,68 @@ final jobsProvider = FutureProvider<List<Job>>(
 );
 
 /// ---------------------------------------------------------------------
-/// Provider 2 — the label of the currently selected filter chip.
+/// Provider 2a — the currently selected LOCATION filter dropdown value.
 ///
-/// StateProvider is the right tool here: it's a single, simple, directly
-/// overwritable value. There's no async work and no derivation in "the
-/// user tapped a different chip" — every tap just replaces the old label
-/// with the new one outright, which is exactly the case StateProvider
-/// exists for.
+/// Now typed as `LocationType?` — an enum with a nullable "not selected"
+/// state — rather than a stringly-typed "All"/"Remote" label. Two wins:
+/// the compiler rules out typos and invalid values, and `null` cleanly
+/// represents "no filter applied" so the dropdown's "All locations" item
+/// doesn't need a magic string.
+///
+/// StateProvider is still the right tool: a single, directly-overwritable
+/// value with no derivation of its own.
 /// ---------------------------------------------------------------------
-final selectedFilterProvider = StateProvider<String>((ref) => 'All');
+final locationFilterProvider =
+    StateProvider<LocationType?>((ref) => null);
+
+/// The set of employment-type labels the Job Type dropdown exposes. Kept
+/// as a String because employmentType on Job is already a String (that's
+/// the API shape, from Assignment 1.1), so filter equality is a direct
+/// string compare with no derived tag in the middle.
+enum JobTypeFilter {
+  fullTime('Full-time'),
+  partTime('Part-time'),
+  contract('Contract'),
+  internship('Internship');
+
+  final String label;
+  const JobTypeFilter(this.label);
+}
 
 /// ---------------------------------------------------------------------
-/// Provider 3 — the filtered job list, derived from providers 1 and 2.
+/// Provider 2b — the currently selected JOB TYPE filter dropdown value.
+/// Same reasoning as [locationFilterProvider] — nullable enum, null == All.
+/// ---------------------------------------------------------------------
+final jobTypeFilterProvider =
+    StateProvider<JobTypeFilter?>((ref) => null);
+
+/// ---------------------------------------------------------------------
+/// Provider 3 — the filtered job list, now derived from THREE inputs:
+/// the raw jobs plus the two independent dropdown filters.
 ///
-/// Plain Provider is the right tool here: nothing ever "sets" this value
-/// directly — it's a pure computation over the two providers above, so
-/// Riverpod recomputes it automatically the instant either input
-/// changes. That's precisely what rules out the manual-sync bug
-/// described in README Q2: this provider has no state of its own to fall
-/// out of sync.
+/// Plain Provider still the right tool: nothing ever "sets" this value
+/// directly — it's a pure computation over the providers above, so
+/// Riverpod recomputes it automatically the instant any one input
+/// changes. Two null-guards mean each dropdown filter contributes ONLY
+/// when the user has picked a non-null value.
 /// ---------------------------------------------------------------------
 final filteredJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
   final jobsAsync = ref.watch(jobsProvider);
-  final selectedFilter = ref.watch(selectedFilterProvider);
+  final locationFilter = ref.watch(locationFilterProvider);
+  final jobTypeFilter = ref.watch(jobTypeFilterProvider);
 
   return jobsAsync.whenData((jobs) {
-    if (selectedFilter == 'All') return jobs;
-    return jobs.where((job) => _matchesFilter(job, selectedFilter)).toList();
+    return jobs.where((job) {
+      if (locationFilter != null && job.locationType != locationFilter) {
+        return false;
+      }
+      if (jobTypeFilter != null && job.employmentType != jobTypeFilter.label) {
+        return false;
+      }
+      return true;
+    }).toList();
   });
 });
-
-/// Matches a job against a filter label using real Job fields only —
-/// never a synthetic/derived tag. 'Remote' checks `location`, which
-/// `Job.remote()` stamps to exactly `'Remote'`; every other label checks
-/// `employmentType` directly, since 'Full-time' and 'Contract' are
-/// already the literal `employmentType` strings used throughout
-/// CareerHub's mock data.
-bool _matchesFilter(Job job, String filterLabel) {
-  if (filterLabel == 'Remote') {
-    return job.location == 'Remote';
-  }
-  return job.employmentType == filterLabel;
-}
 
 /// ---------------------------------------------------------------------
 /// Stretch A — sort order.
@@ -210,6 +230,7 @@ final List<Job> _mockJobs = [
     title: 'Senior Flutter Developer',
     company: 'Bitcube',
     location: 'Cape Town, ZA',
+    locationType: LocationType.onSite,
     salary: 'R55 000 – R75 000 per month',
     employmentType: 'Full-time',
     closingDate: DateTime(2026, 8, 15),
@@ -223,6 +244,7 @@ final List<Job> _mockJobs = [
     title: 'Junior Backend Engineer',
     company: 'Nimbus Systems',
     location: 'Johannesburg, ZA',
+    locationType: LocationType.onSite,
     employmentType: 'Full-time',
     isOpen: true,
   ),
@@ -231,6 +253,7 @@ final List<Job> _mockJobs = [
     title: 'Product Designer',
     company: 'Loop Studio',
     location: 'Durban, ZA',
+    locationType: LocationType.onSite,
     salary: 'R40 000 per month',
     employmentType: 'Contract',
     closingDate: DateTime(2026, 5, 1),
@@ -251,6 +274,7 @@ final List<Job> _mockJobs = [
     title: 'UX Researcher',
     company: 'Meridian Labs',
     location: 'Pretoria, ZA',
+    locationType: LocationType.onSite,
     salary: 'R48 000 – R58 000 per month',
     employmentType: 'Full-time',
     closingDate: DateTime(2026, 10, 1),
@@ -265,6 +289,37 @@ final List<Job> _mockJobs = [
     company: 'Fathom Analytics',
     employmentType: 'Contract',
     closingDate: DateTime(2026, 8, 20),
+    isOpen: true,
+  ),
+  // Added with the two-dropdown filter change so every dropdown option has
+  // matching data — one hybrid Part-time role...
+  Job(
+    id: 7,
+    title: 'Content Writer',
+    company: 'Northwind Media',
+    location: 'Cape Town, ZA',
+    locationType: LocationType.hybrid,
+    salary: 'R25 000 per month',
+    employmentType: 'Part-time',
+    closingDate: DateTime(2026, 9, 10),
+    description:
+        'Split your week between the studio and home — write long-form '
+        'features on the future of work.',
+    isOpen: true,
+  ),
+  // ...and one on-site Internship.
+  Job(
+    id: 8,
+    title: 'Marketing Intern',
+    company: 'Bright Ventures',
+    location: 'Sandton, ZA',
+    locationType: LocationType.onSite,
+    salary: 'R8 000 per month stipend',
+    employmentType: 'Internship',
+    closingDate: DateTime(2026, 7, 30),
+    description:
+        'Six-month on-site internship supporting the growth team on '
+        'campaigns and events.',
     isOpen: true,
   ),
 ];

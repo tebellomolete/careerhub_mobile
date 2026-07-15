@@ -98,19 +98,19 @@ void main() {
           find.widgetWithText(NavigationDestination, 'Saved'), findsOneWidget);
     });
 
-    testWidgets('Filter chip row is present and scrollable',
+    testWidgets('Two filter dropdowns (Location and Job type) are present',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-      // All filter chips should exist: All, Remote, Full-time, Contract.
-      // Matched via widgetWithText rather than bare find.text: 'Remote',
-      // 'Full-time', and 'Contract' are also real Job field values that
-      // render inside job cards, so a bare text search is ambiguous
-      // once real data is on screen.
-      expect(find.byType(ChoiceChip), findsNWidgets(4));
-      expect(find.widgetWithText(ChoiceChip, 'All'), findsOneWidget);
-      expect(find.widgetWithText(ChoiceChip, 'Remote'), findsOneWidget);
-      expect(find.widgetWithText(ChoiceChip, 'Full-time'), findsOneWidget);
-      expect(find.widgetWithText(ChoiceChip, 'Contract'), findsOneWidget);
+      // The tutor-requested change: chips replaced with two typed
+      // dropdowns. Each is a DropdownButtonFormField, so we should find
+      // exactly two — and each shows its labelText as the field label
+      // in the tree (Location / Job type).
+      expect(find.byType(DropdownButtonFormField<LocationType?>),
+          findsOneWidget);
+      expect(find.byType(DropdownButtonFormField<JobTypeFilter?>),
+          findsOneWidget);
+      expect(find.text('Location'), findsOneWidget);
+      expect(find.text('Job type'), findsOneWidget);
     });
   });
 
@@ -203,15 +203,24 @@ void main() {
     });
   });
 
-  group('Reactive Filtering (Assignment 1.3)', () {
-    testWidgets('tapping the Remote chip filters out non-remote jobs',
+  group('Reactive Filtering (dropdowns)', () {
+    // Helper: grab the running ProviderContainer so tests can drive filter
+    // state directly without having to open dropdown menus (which are an
+    // overlay-based interaction that's flaky to script). The dropdown UI
+    // wiring is proved by a dedicated "opens dropdown and picks Remote"
+    // test below; these two focus on the reactive filter behaviour.
+    ProviderContainer containerFor(WidgetTester tester) =>
+        ProviderScope.containerOf(tester.element(find.byType(CareerHubApp)));
+
+    testWidgets('selecting a location filters out non-matching jobs',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
       // Before filtering: a non-remote job is visible.
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
 
-      await tester.tap(find.widgetWithText(ChoiceChip, 'Remote'));
+      containerFor(tester).read(locationFilterProvider.notifier).state =
+          LocationType.remote;
       await tester.pump();
 
       // After filtering: only the two remote jobs remain.
@@ -220,17 +229,61 @@ void main() {
       expect(find.text('Technical Support Engineer'), findsOneWidget);
     });
 
-    testWidgets('tapping All restores the full list',
+    testWidgets('clearing the location filter restores the full list',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
-      await tester.tap(find.widgetWithText(ChoiceChip, 'Remote'));
+      final container = containerFor(tester);
+      container.read(locationFilterProvider.notifier).state =
+          LocationType.remote;
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsNothing);
 
-      await tester.tap(find.widgetWithText(ChoiceChip, 'All'));
+      // null == "All locations" — the dropdown's null-valued item.
+      container.read(locationFilterProvider.notifier).state = null;
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
+    });
+
+    testWidgets('the two dropdowns compose (Remote + Full-time narrows to '
+        'the intersection)', (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+      final container = containerFor(tester);
+
+      container.read(locationFilterProvider.notifier).state =
+          LocationType.remote;
+      container.read(jobTypeFilterProvider.notifier).state =
+          JobTypeFilter.fullTime;
+      await tester.pump();
+
+      // Only DevOps Engineer is BOTH remote AND full-time — Technical
+      // Support Engineer is remote but contract, so it drops out.
+      expect(find.text('DevOps Engineer'), findsOneWidget);
+      expect(find.text('Technical Support Engineer'), findsNothing);
+      expect(find.text('Senior Flutter Developer'), findsNothing);
+    });
+
+    testWidgets(
+        'tapping the Location dropdown opens the menu and picking Remote '
+        'updates the provider', (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+      final container = containerFor(tester);
+      expect(container.read(locationFilterProvider), isNull);
+
+      // Open the Location dropdown (typed generically so it matches
+      // regardless of which item is currently selected).
+      await tester
+          .tap(find.byType(DropdownButtonFormField<LocationType?>));
+      await tester.pumpAndSettle();
+
+      // Now the menu is in an overlay. Tap the "Remote" menu item. The
+      // overlay is inserted at the END of the tree, so `.last` targets
+      // the menu row rather than a job-card location text.
+      await tester.tap(find.text('Remote').last);
+      await tester.pumpAndSettle();
+
+      expect(container.read(locationFilterProvider), LocationType.remote);
+      expect(find.text('Senior Flutter Developer'), findsNothing);
     });
   });
 
@@ -244,8 +297,12 @@ void main() {
       await pumpLoadedApp(tester, surface: const Size(800, 1400));
 
       // Narrow to the two remote jobs so there are only two candidates
-      // to reason about the order of.
-      await tester.tap(find.widgetWithText(ChoiceChip, 'Remote'));
+      // to reason about the order of. Drive the filter provider directly
+      // (dropdown UI is exercised in the Reactive Filtering group).
+      final container = ProviderScope.containerOf(
+          tester.element(find.byType(CareerHubApp)));
+      container.read(locationFilterProvider.notifier).state =
+          LocationType.remote;
       await tester.pump();
 
       double dxOf(String title) => tester.getTopLeft(find.text(title)).dx;
@@ -313,6 +370,7 @@ void main() {
         title: 'Test Developer',
         company: 'Test Corp',
         location: 'Test City',
+        locationType: LocationType.onSite,
         employmentType: 'Full-time',
         isOpen: true,
       );
@@ -341,6 +399,7 @@ void main() {
         title: 'Minimal Job',
         company: 'Company',
         location: 'Somewhere',
+        locationType: LocationType.onSite,
         employmentType: 'Part-time',
       );
 
@@ -364,6 +423,7 @@ void main() {
         title: 'Job with Description',
         company: 'Company',
         location: 'Location',
+        locationType: LocationType.onSite,
         employmentType: 'Full-time',
         description: 'This is a test description.',
         isOpen: true,
@@ -458,6 +518,7 @@ void main() {
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
+        locationType: LocationType.onSite,
         employmentType: 'Full-time',
         isOpen: true,
       );
@@ -482,6 +543,7 @@ void main() {
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
+        locationType: LocationType.onSite,
         employmentType: 'Full-time',
         isOpen: true,
       );
