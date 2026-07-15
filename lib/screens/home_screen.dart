@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-// Needed for .notifier/.state on selectedFilterProvider — see the note
+// Needed for .notifier/.state on the StateProviders below — see the note
 // in job_providers.dart on why StateProvider needs this import as of
 // Riverpod 3.0.
 import 'package:flutter_riverpod/legacy.dart';
@@ -13,23 +13,29 @@ import '../widgets/empty_jobs_widget.dart';
 /// CareerHub's main screen.
 ///
 /// Assignment 1.3 changes from 1.2:
-/// - HomeScreen is now a ConsumerWidget instead of StatelessWidget. It
-///   still has no state of its own — it just needs `ref` to watch
-///   providers.
-/// - The static `_jobs` field is gone entirely. Job data now lives in
-///   lib/providers/job_providers.dart, loaded asynchronously.
-/// - build() watches a single provider — filteredJobsProvider — and
-///   uses AsyncValue.when() to render one of three states: loading,
-///   error, or the (possibly filtered, possibly empty) job list.
+/// - HomeScreen watches live Riverpod state instead of a static field.
 /// - The LayoutBuilder / ListView.builder / GridView.builder / _buildCard
 ///   logic is otherwise untouched from Assignment 1.2 — only its data
 ///   source changed from a static field to a `jobs` parameter.
-class HomeScreen extends ConsumerWidget {
+///
+/// Stretch C promotes this from ConsumerWidget to ConsumerStatefulWidget
+/// — see _HomeScreenState and README, Stretch C, for why: it's the
+/// TextEditingController's lifecycle, not a UI complexity threshold,
+/// that forces this change.
+class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
-  /// Unchanged from Assignment 1.2 — still just chip labels. The values
-  /// that matter for filtering now live in job_providers.dart's
-  /// `_matchesFilter`.
+  @override
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  /// Owned here, not by any provider, specifically because it has an
+  /// imperative lifecycle (create once, dispose once) that Riverpod's
+  /// snapshot-based state model isn't built to express. See README,
+  /// Stretch C.
+  late final TextEditingController _searchController;
+
   static const List<String> _filters = [
     'All',
     'Remote',
@@ -37,29 +43,76 @@ class HomeScreen extends ConsumerWidget {
     'Contract',
   ];
 
-  // Unchanged from Assignment 1.2.
   static const double _gridBreakpoint = 600;
   static const double _threeColumnBreakpoint = 840;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    // The ONLY provider HomeScreen itself watches. It already carries
-    // both the loading/error state of the jobs fetch AND the current
-    // filter selection, composed for us — HomeScreen doesn't need to
-    // know two separate providers exist underneath it.
-    final filteredJobsAsync = ref.watch(filteredJobsProvider);
+  void initState() {
+    super.initState();
+    _searchController = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // ConsumerState exposes `ref` as a property (not a build() parameter
+    // the way ConsumerWidget does). This is still the ONLY provider
+    // HomeScreen watches directly — the same single ref.watch call as
+    // before Stretch A/B/C existed. Every new dimension of state (sort,
+    // the failure toggle, search) was added one layer below, inside
+    // visibleJobsProvider or a sibling ConsumerWidget — never as an
+    // extra watch call here. See README, Stretch A.
+    final visibleJobsAsync = ref.watch(visibleJobsProvider);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('CareerHub'),
         centerTitle: false,
+        actions: const [
+          _SortButton(),
+          _FailToggleButton(),
+          SizedBox(width: 4),
+        ],
       ),
       body: Column(
         children: [
+          // Stretch C — search box, above the filter chips as specified.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: TextField(
+              controller: _searchController,
+              onChanged: (value) =>
+                  ref.read(searchQueryProvider.notifier).state = value,
+              decoration: InputDecoration(
+                isDense: true,
+                hintText: 'Search job titles…',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchController.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        tooltip: 'Clear search',
+                        onPressed: () {
+                          _searchController.clear();
+                          ref.read(searchQueryProvider.notifier).state = '';
+                        },
+                      ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+
           const _FilterChipRow(filters: _filters),
 
           Expanded(
-            child: filteredJobsAsync.when(
+            child: visibleJobsAsync.when(
               loading: () => const Center(
                 child: CircularProgressIndicator(),
               ),
@@ -68,15 +121,15 @@ class HomeScreen extends ConsumerWidget {
               ),
               data: (jobs) {
                 // README Q3's fourth condition: loaded successfully, but
-                // zero jobs matched the current filter. Not an error,
-                // not "no jobs exist" — needs its own message so the
-                // user knows to try a different filter rather than
-                // assuming the app is broken.
+                // zero jobs matched the current filter/search. Not an
+                // error, not "no jobs exist" — needs its own message so
+                // the user knows to adjust their filter or search rather
+                // than assuming the app is broken.
                 if (jobs.isEmpty) {
                   return const EmptyJobsWidget(
                     icon: Icons.filter_alt_off_outlined,
-                    title: 'No jobs match this filter',
-                    message: 'Try a different filter to see more listings.',
+                    title: 'No jobs match your filters',
+                    message: 'Try a different filter or search term.',
                   );
                 }
 
@@ -135,14 +188,13 @@ class HomeScreen extends ConsumerWidget {
 /// The pinned, horizontally-scrolling filter row above the job
 /// list/grid.
 ///
-/// Assignment 1.3 change: this is now its OWN ConsumerWidget rather than
-/// a StatelessWidget fed by HomeScreen. That's deliberate, not
-/// incidental — the brief disallows passing callback functions down
-/// through widget constructors. The reason that restriction matters is
-/// the same mechanism behind README Q1: a callback threaded down through
-/// a constructor is still just a callback, so calling ref.watch inside
-/// it would be exactly as meaningless as calling it inside onSelected
-/// directly. Instead, _FilterChipRow reads and writes
+/// Its own ConsumerWidget rather than a plain one fed by HomeScreen —
+/// deliberate, not incidental. The brief disallows passing callback
+/// functions down through widget constructors, and the reason that
+/// matters is the same mechanism behind README Q1: a callback threaded
+/// down through a constructor is still just a callback, so putting
+/// ref.watch inside it would be exactly as meaningless as putting it in
+/// onSelected directly. Instead, _FilterChipRow reads and writes
 /// selectedFilterProvider itself — HomeScreen never even needs to know
 /// that provider exists.
 class _FilterChipRow extends ConsumerWidget {
@@ -152,8 +204,6 @@ class _FilterChipRow extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // build() -> ref.watch: this row must rebuild whenever the selection
-    // changes so the correct chip highlights.
     final selectedFilter = ref.watch(selectedFilterProvider);
 
     return SingleChildScrollView(
@@ -168,9 +218,6 @@ class _FilterChipRow extends ConsumerWidget {
                 label: Text(filter),
                 selected: filter == selectedFilter,
                 onSelected: (_) {
-                  // callback -> ref.read: this runs once, at the moment
-                  // of the tap. It only needs to fire off an update, not
-                  // subscribe to anything.
                   ref.read(selectedFilterProvider.notifier).state = filter;
                 },
               ),
@@ -181,7 +228,64 @@ class _FilterChipRow extends ConsumerWidget {
   }
 }
 
-/// Shown when jobsProvider's AsyncValue is in the error state.
+/// Stretch A — sort control. Its own ConsumerWidget for the same reason
+/// as _FilterChipRow: it owns its slice of state end-to-end, so
+/// HomeScreen's watch count never grows when a new stretch goal is
+/// added.
+class _SortButton extends ConsumerWidget {
+  const _SortButton();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final sortOrder = ref.watch(sortOrderProvider);
+
+    return PopupMenuButton<SortOrder>(
+      icon: const Icon(Icons.sort_by_alpha),
+      tooltip: 'Sort by title',
+      onSelected: (value) =>
+          ref.read(sortOrderProvider.notifier).state = value,
+      itemBuilder: (context) => [
+        CheckedPopupMenuItem(
+          value: SortOrder.aToZ,
+          checked: sortOrder == SortOrder.aToZ,
+          child: const Text('Title: A–Z'),
+        ),
+        CheckedPopupMenuItem(
+          value: SortOrder.zToA,
+          checked: sortOrder == SortOrder.zToA,
+          child: const Text('Title: Z–A'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Stretch B — toggles the simulated network failure AND retries in one
+/// tap, exactly as the brief specifies. Tapping it while a failure is
+/// already active flips the flag back off before invalidating, so the
+/// second tap is what actually recovers — see README, Stretch B, for
+/// the full documented sequence.
+class _FailToggleButton extends ConsumerWidget {
+  const _FailToggleButton();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final shouldFail = ref.watch(shouldFailProvider);
+
+    return IconButton(
+      icon: Icon(shouldFail ? Icons.wifi_off : Icons.wifi),
+      tooltip: shouldFail
+          ? 'Simulated failure is ON — tap to fix and retry'
+          : 'Simulate a failed fetch',
+      onPressed: () {
+        ref.read(shouldFailProvider.notifier).state = !shouldFail;
+        ref.invalidate(jobsProvider);
+      },
+    );
+  }
+}
+
+/// Shown when visibleJobsProvider's AsyncValue is in the error state.
 /// Deliberately generic and friendly — CareerHub never surfaces a raw
 /// exception string to a job seeker.
 class _ErrorState extends StatelessWidget {

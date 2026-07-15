@@ -10,10 +10,10 @@ import 'package:careerhub_mobile/widgets/empty_jobs_widget.dart';
 /// Assignment 1.3, Question 4 — fixes both failure modes in one place.
 ///
 /// Failure mode 1 (architecture): HomeScreen and its filter chip row are
-/// now ConsumerWidgets, which require a ProviderScope ancestor. Pumping
-/// CareerHubApp bare (as the old tests did) never goes through main() —
-/// where ProviderScope is added — so it throws. Fixed by wrapping every
-/// pump of CareerHubApp in ProviderScope here.
+/// now Consumer(Stateful)Widgets, which require a ProviderScope ancestor.
+/// Pumping CareerHubApp bare (as the old tests did) never goes through
+/// main() — where ProviderScope is added — so it throws. Fixed by
+/// wrapping every pump of CareerHubApp in ProviderScope here.
 ///
 /// Failure mode 2 (async timing): jobsProvider now spends its first
 /// ~1.5 simulated seconds in the `loading` state via a real
@@ -92,7 +92,7 @@ void main() {
 
       await pumpLoadedApp(tester);
 
-      // Six jobs total (the four from 1.1 + 2 added for Stretch B)
+      // Six jobs total (the four from 1.1 + 2 added for Stretch B of 1.2)
       expect(find.byType(JobCard), findsWidgets);
       // At least one card should be visible in portrait list
       expect(find.byType(Card), findsWidgets);
@@ -100,6 +100,15 @@ void main() {
 
     testWidgets('All four original Job variants render correctly',
         (WidgetTester tester) async {
+      // Generous viewport: this test looks for four different jobs
+      // spread across the unfiltered six-job grid, and Assignment 1.3
+      // added a search field above the chip row, shrinking the space
+      // left for the list itself. A wide, tall surface keeps every card
+      // comfortably built without depending on how far Flutter's default
+      // list/grid cache extent happens to reach.
+      tester.binding.window.physicalSizeTestValue = const Size(1200, 2000);
+      addTearDown(tester.binding.window.clearPhysicalSizeTestValue);
+
       await pumpLoadedApp(tester);
 
       // Job 1: Fully populated
@@ -173,6 +182,73 @@ void main() {
       await tester.tap(find.widgetWithText(ChoiceChip, 'All'));
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
+    });
+  });
+
+  group('Stretch Goals (Assignment 1.3)', () {
+    testWidgets('sort menu reverses job order (Stretch A)',
+        (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+
+      // Narrow to the two remote jobs so there are only two candidates
+      // to reason about the order of.
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Remote'));
+      await tester.pump();
+
+      double dxOf(String title) => tester.getTopLeft(find.text(title)).dx;
+
+      // Default sort is A -> Z: "DevOps Engineer" sorts before
+      // "Technical Support Engineer", landing in the earlier grid cell
+      // (smaller dx).
+      expect(dxOf('DevOps Engineer'),
+          lessThan(dxOf('Technical Support Engineer')));
+
+      await tester.tap(find.byIcon(Icons.sort_by_alpha));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Title: Z–A'));
+      await tester.pumpAndSettle();
+
+      expect(dxOf('Technical Support Engineer'),
+          lessThan(dxOf('DevOps Engineer')));
+    });
+
+    testWidgets(
+        'failure toggle shows the error state; tapping again recovers '
+        '(Stretch B)', (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+      expect(find.byType(JobCard), findsWidgets);
+
+      // First tap: turns the simulated failure ON and retries.
+      await tester.tap(find.byIcon(Icons.wifi));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+
+      expect(find.text('Something went wrong'), findsOneWidget);
+      expect(find.byType(JobCard), findsNothing);
+
+      // Second tap (on the now-different icon): turns the simulated
+      // failure back OFF and retries again — this is the attempt that
+      // succeeds.
+      await tester.tap(find.byIcon(Icons.wifi_off));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+
+      expect(find.text('Something went wrong'), findsNothing);
+      expect(find.byType(JobCard), findsWidgets);
+    });
+
+    testWidgets('search field filters jobs by title (Stretch C)',
+        (WidgetTester tester) async {
+      await pumpLoadedApp(tester);
+
+      expect(find.text('Senior Flutter Developer'), findsOneWidget);
+      expect(find.text('UX Researcher'), findsOneWidget);
+
+      await tester.enterText(find.byType(TextField), 'ux');
+      await tester.pump();
+
+      expect(find.text('UX Researcher'), findsOneWidget);
+      expect(find.text('Senior Flutter Developer'), findsNothing);
     });
   });
 

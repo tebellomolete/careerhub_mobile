@@ -21,20 +21,42 @@ import '../models/job.dart';
 /// class, a `build()` override, and an `AsyncNotifierProvider` wrapper
 /// for zero extra capability at this stage, since CareerHub never needs
 /// to mutate this list piecemeal — only re-fetch it wholesale.
-///
-/// Note (Riverpod 3.0): providers now auto-retry on error by default (up
-/// to 10 attempts, 200ms doubling to 6.4s) before AsyncValue ever reaches
-/// `error`. That's invisible here because this provider never throws in
-/// this submission — see README, Assignment 1.3 Stretch B, for where
-/// this becomes relevant.
 /// ---------------------------------------------------------------------
-final jobsProvider = FutureProvider<List<Job>>((ref) async {
-  // Simulated network round-trip. Assignment 1.3 Part 2 requires the
-  // loading state to be visible for at least one second; the Part 3
-  // checkpoint expects "approximately 1.5 seconds."
-  await Future.delayed(const Duration(milliseconds: 1500));
-  return _mockJobs;
-});
+final jobsProvider = FutureProvider<List<Job>>(
+  (ref) async {
+    // Simulated network round-trip. Assignment 1.3 Part 2 requires the
+    // loading state to be visible for at least one second; the Part 3
+    // checkpoint expects "approximately 1.5 seconds."
+    await Future.delayed(const Duration(milliseconds: 1500));
+
+    // Stretch B: deliberately ref.read, not ref.watch. Watching here
+    // would make jobsProvider reactive to shouldFailProvider all by
+    // itself, so simply flipping the switch would silently re-trigger a
+    // fetch with no explicit ref.invalidate needed — which contradicts
+    // the brief's two-step design ("toggles shouldFailProvider AND calls
+    // ref.invalidate(jobsProvider)"), and risks the two mechanisms firing
+    // a double fetch. ref.read takes a one-off snapshot at the moment
+    // THIS execution starts — exactly what a provider body that only
+    // wants "whatever the flag is right now" needs. It's the same
+    // watch-vs-read reasoning as README Q1, just applied inside a
+    // provider instead of a widget.
+    final shouldFail = ref.read(shouldFailProvider);
+    if (shouldFail) {
+      throw Exception(
+        'Simulated network failure. Tap the toggle again to recover.',
+      );
+    }
+    return _mockJobs;
+  },
+  // Riverpod 3.0 auto-retries a throwing provider by default — up to 10
+  // attempts, with an exponential backoff from 200ms to 6.4s — before
+  // AsyncValue ever reaches `error`. That's exactly wrong for a MANUAL
+  // failure toggle: without this override, tapping "simulate failure"
+  // would appear to do nothing for up to ~38 seconds while Riverpod
+  // silently retries (and fails) behind the scenes. Disabled here, only
+  // for this provider, so Stretch B's fail/retry sequence is instant.
+  retry: (retryCount, error) => null,
+);
 
 /// ---------------------------------------------------------------------
 /// Provider 2 — the label of the currently selected filter chip.
@@ -56,11 +78,6 @@ final selectedFilterProvider = StateProvider<String>((ref) => 'All');
 /// changes. That's precisely what rules out the manual-sync bug
 /// described in README Q2: this provider has no state of its own to fall
 /// out of sync.
-///
-/// The return type is AsyncValue<List<Job>>, not List<Job> — this lets
-/// the loading/error state of the underlying fetch flow straight through
-/// to HomeScreen with no extra plumbing, so HomeScreen only ever needs to
-/// watch ONE provider and hand it to AsyncValue.when().
 /// ---------------------------------------------------------------------
 final filteredJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
   final jobsAsync = ref.watch(jobsProvider);
@@ -84,6 +101,64 @@ bool _matchesFilter(Job job, String filterLabel) {
   }
   return job.employmentType == filterLabel;
 }
+
+/// ---------------------------------------------------------------------
+/// Stretch A — sort order.
+///
+/// A plain enum, not a raw String: the set of valid sort orders is
+/// small, fixed, and closed, so an enum lets the compiler (and every
+/// switch/comparison on it) rule out typos and invalid values the way a
+/// String never could.
+/// ---------------------------------------------------------------------
+enum SortOrder { aToZ, zToA }
+
+/// Second StateProvider, exactly as the brief asks for — same
+/// justification as selectedFilterProvider: a single, directly
+/// overwritable value with no derivation of its own.
+final sortOrderProvider = StateProvider<SortOrder>((ref) => SortOrder.aToZ);
+
+/// ---------------------------------------------------------------------
+/// Stretch B — the manual failure toggle. Defaults to false, so out of
+/// the box CareerHub behaves exactly as it did before this stretch goal
+/// existed.
+/// ---------------------------------------------------------------------
+final shouldFailProvider = StateProvider<bool>((ref) => false);
+
+/// ---------------------------------------------------------------------
+/// Stretch C — the search box's current text.
+/// ---------------------------------------------------------------------
+final searchQueryProvider = StateProvider<String>((ref) => '');
+
+/// ---------------------------------------------------------------------
+/// The single provider HomeScreen watches for job data — filtered,
+/// sorted, AND searched.
+///
+/// This composes ON TOP of filteredJobsProvider rather than re-reading
+/// jobsProvider/selectedFilterProvider directly and re-implementing
+/// filtering here: filteredJobsProvider is already "reactive to jobs and
+/// the filter," so anything that watches IT is transitively reactive to
+/// both, with no duplicated logic. That's what "the reactive graph
+/// composes" means in practice — see README, Stretch A.
+///
+/// Search reuses Job.matches() — written and unit-tested in Assignment
+/// 1.1's Stretch B, but never actually wired into the UI until now.
+/// ---------------------------------------------------------------------
+final visibleJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
+  final filteredAsync = ref.watch(filteredJobsProvider);
+  final sortOrder = ref.watch(sortOrderProvider);
+  final searchQuery = ref.watch(searchQueryProvider);
+
+  return filteredAsync.whenData((jobs) {
+    final searched = searchQuery.trim().isEmpty
+        ? jobs
+        : jobs.where((job) => job.matches(searchQuery)).toList();
+
+    final sorted = [...searched]..sort(
+        (a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()));
+
+    return sortOrder == SortOrder.zToA ? sorted.reversed.toList() : sorted;
+  });
+});
 
 /// The mock "backend" data — moved here from HomeScreen (Assignment 1.3
 /// Part 2: "Job data is no longer a field on HomeScreen"). Unchanged
