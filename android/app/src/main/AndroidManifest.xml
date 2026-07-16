@@ -1,8 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Assignment 2.1 — usesCleartextTraffic="true".
+         Our CareerHub API runs on http://10.0.2.2:5254 in development
+         (the Android emulator's alias for the host machine's localhost).
+         Android 9 (API 28) and above block cleartext HTTP by default;
+         without this flag Dio would fail every request with a
+         SocketException before it ever reached the API. This flag is
+         DEV-ONLY: a production build would remove it and target HTTPS. -->
     <application
         android:label="careerhub_mobile"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

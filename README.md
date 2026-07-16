@@ -1,8 +1,443 @@
-# CareerHub — Assignment 1.1: The Job Model & First Widget
+# CareerHub — Assignment 2.1: HTTP, Repositories & Code Generation
 
-Week 1, Day 1. This README contains all written decisions (Part 1), the
-scratch output (Part 2), manual verification notes (Part 3), and the colour
-justification (Part 4).
+_Written 2026-07-16._
+
+Week 2, Assignment 2.1. This section contains the four written decisions
+(Part 1), the stretch-goal writeups, the required screenshots, and the
+run-book. The Assignment 1.1–1.4 notes are preserved further down as
+historical context.
+
+---
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — Why a DTO, not a `fromJson` on the `Job` model
+
+**Field-name mismatches (API vs Flutter `Job`).** Opened
+`CareerHub.Api/DTOs/JobResponse.cs` alongside `lib/models/job.dart`:
+
+| API field (`JobResponse`) | Flutter field (`Job`) | Notes |
+|---|---|---|
+| `id` (`Guid`) | `id` (was `int`, now **`String`**) | Type mismatch as well as a semantic change — Assignment 2.1 changes `Job.id` from `int` to `String`. |
+| `companyName` | `company` | Pure rename. |
+| `type` (`"FullTime"`/`"PartTime"`/…) | `employmentType` (`"Full-time"`/`"Part-time"`/…) | Rename AND value re-hyphenation. |
+| `salaryDisplay` (string, `"Salary not specified"` when absent) | `salary` (nullable) | Rename AND sentinel-to-null translation. |
+| `postedAt` | *(not on `Job`)* | Captured in `JobDto` only. |
+| `applicationCount` | *(not on `Job`)* | Captured in `JobDto` only. |
+| *(no field on API)* | `locationType` | Derived by `Job.inferLocationType(location)` — string heuristic. |
+| *(not in list endpoint)* | `closingDate` | Left `null` until we call the detail endpoint. |
+| *(not in list endpoint)* | `isOpen` | List endpoint only returns active listings, so `true`. |
+
+**"If the API team renamed `companyName` tomorrow, which Flutter file would
+break?"** Without a DTO, ANY file that reads `job.company` — and,
+because a `fromJson` on `Job` would key on `companyName` directly, so
+would every `Job.fromJson` call site AND every widget that touches the
+company field. `JobCard`, `JobDetailScreen`, the widget test's
+`find.text('Bitcube')`, and any future search or analytics site would all
+need to be reviewed. Not because the UI changed, but because the
+rename leaked across the boundary.
+
+**File-change count comparison.**
+
+- **With a DTO in place (this assignment):** exactly **2** files change to
+  absorb an API field rename — `lib/data/job_dto.dart` (the JSON key)
+  and `lib/models/job.dart` (the `Job.fromDto` field read). Zero widgets,
+  zero screens, zero providers, zero tests.
+- **Without a DTO (`Job.fromJson` directly):** the rename ripples to
+  every file that spells the new API name in its JSON parsing, plus every
+  test fixture that constructed a `Job` using the old field name in
+  `fromJson`, plus (if the Flutter field had matched the API name) every
+  widget that reads the field. Realistically **5–8+ files** for a
+  small app, unbounded on a large one.
+
+That number difference matters because a rename is an API-team decision
+that the mobile team must ABSORB, not participate in. A change surface of
+2 files is a lunch-break patch review; a change surface of 8 files is a
+sprint's worth of coordination and merge conflicts.
+
+**"Should the DTO capture fields the `Job` model does not have?"** Yes,
+and my `JobDto` does — `postedAt` and `applicationCount` are captured
+even though no widget reads them today. The reason is asymmetric cost:
+adding a field to the DTO now is a one-line edit that never needs a code
+review; adding it later ("we need to show 'posted 3 days ago'") means a
+DTO change + a regeneration + a mapping change + a PR review. Six months
+from now the alternative is bad in two ways — you either forget the
+field exists on the wire (and re-derive it client-side), or you make the
+change and pay the round-trip cost when you could have paid one line
+up-front.
+
+### Question 2 — Why the repository owns Dio, not the provider
+
+**Callers of `ref.watch(jobsProvider)` / `ref.watch(filteredJobsProvider)`
+in the current tree.** Grepping the `lib/` tree finds four:
+
+- `lib/screens/home_screen.dart` — via `visibleJobsProvider`, which
+  composes on top.
+- `lib/screens/job_detail_screen.dart` — directly on
+  `jobsProvider`.
+- `lib/screens/saved_screen.dart` — via `savedJobsProvider`, which reads
+  the notifier.
+- `lib/providers/job_providers.dart` — the derived providers themselves
+  (`filteredJobsProvider`, `visibleJobsProvider`, `savedJobsProvider`).
+
+**How many callers need to know the data came from HTTP?** Zero. Every
+caller works with `AsyncValue<List<Job>>` — a shape that is identical
+whether the underlying source is a hardcoded list, a JSON file on disk,
+a SQLite table, or a live Dio request. The whole point of the repository
+is that "where jobs come from" is a private implementation detail of one
+file (`lib/data/jobs_repository.dart`), invisible to the four callers
+above.
+
+**"Switch from Dio to `http` — which files change?"**
+
+- **With the repository pattern:** exactly **1** file. Only
+  `lib/data/jobs_repository.dart` (the `dio` provider becomes a `Client`
+  provider, `JobsRepository` receives a `Client`, and `getJobs()` calls
+  `client.get(...)` and does its own JSON decode). Nothing above the
+  repository moves.
+- **Without it (Dio inside `JobsNotifier.build()`):** `JobsNotifier`
+  changes; every test that mocks Dio via subclass or interceptor
+  changes; anything that reads a `DioException` (e.g. a typed error
+  handler) changes. In practice **3–5+** files, spread across the
+  provider layer AND the test layer.
+
+On a team where two people are working simultaneously on different
+files, a one-file change is a merge-conflict-free unit-of-work — you
+change it, you rebase, you PR. A five-file change means the two devs
+have to sync on it before landing, because both will have edits in
+overlapping regions of the same provider file. The repository pattern
+converts "coordinate with your teammate first" into "just do it."
+
+### Question 3 — What `@riverpod` generates and why the red underline is expected
+
+**What is `_$JobsNotifier` and where does it come from?** It is the
+abstract base class that `package:riverpod_generator` emits into
+`lib/providers/jobs_notifier.g.dart` when it runs. The generator reads
+the source of `JobsNotifier`, notices the `@riverpod` annotation on the
+class, and emits:
+
+1. `abstract class _$JobsNotifier extends AutoDisposeAsyncNotifier<List<Job>>`
+   — the base class my hand-written `JobsNotifier` extends.
+2. `final jobsProvider = AutoDisposeAsyncNotifierProvider<JobsNotifier, List<Job>>(...)`
+   — the actual provider variable that widgets read.
+
+Until that file exists, the IDE cannot find `_$JobsNotifier` and shows a
+red underline. **The command that makes the red underline disappear is:**
+
+```
+dart run build_runner build --delete-conflicting-outputs
+```
+
+**Which part of my hand-written class did the generator read to
+determine the type parameters?** The **`build()` method's return type**:
+`Future<List<Job>>`. That is where the `List<Job>` on the provider's type
+parameters comes from. If I renamed `Job` to `JobListing` and re-ran the
+generator, the emitted provider would automatically become
+`AsyncNotifierProvider<JobsNotifier, List<JobListing>>` — I never type
+those parameters by hand.
+
+**Manual-provider mistake that compiles but blows up at runtime.**
+Before code generation, a developer writing the provider by hand had to
+spell the type parameters themselves:
+
+```dart
+// hand-written — bug ahead
+final jobsProvider =
+    AsyncNotifierProvider<JobsNotifier, List<Company>>(JobsNotifier.new);
+//                                       ^^^^^^^^^^^^ wrong! JobsNotifier
+//                                       actually returns List<Job>.
+```
+
+Both `Company` and `Job` are valid types, so the Dart type checker sees
+`AsyncNotifierProvider<..., List<Company>>` as internally consistent and
+the code compiles. At runtime, the first widget that does
+`ref.watch(jobsProvider).whenData((companies) => ...)` receives
+a `List<Job>` and calls `.company.name` on the first element, throwing
+`NoSuchMethodError: Class 'Job' has no instance getter 'company'`. This
+category of bug — a lie in the type parameters that the compiler cannot
+catch because the parameters were the developer's guess, not derived
+from the notifier's actual `build()` — is exactly what `@riverpod` makes
+impossible. The generator reads the ONE source of truth (the return
+type of `build`) and can only ever emit provider parameters that match.
+
+### Question 4 — Why the test overrides the provider instead of mocking the network
+
+**Failure path when `flutter test` runs against the real provider on a
+machine with no API server.** `JobsNotifier.build()` calls
+`repo.getJobs()`, which awaits `_dio.get('/jobs', ...)`. Dio tries to
+open a TCP connection to the configured dev base URL
+(`http://localhost:5254` by default, or the emulator alias
+`http://10.0.2.2:5254` if that override was passed), the host is
+unreachable, and Dio throws a `DioException` whose `type` is
+`DioExceptionType.connectionError` and whose cause is
+`SocketException: OS Error: Connection refused`. `AsyncNotifier` catches
+that exception on the `Future` returned by `build()` and moves its state
+to `AsyncValue.error(exception, stackTrace)`. The widget tree's
+`when(loading: ..., data: ..., error: ...)` renders the error branch —
+the `_ErrorState` widget. **The test does not fail on an assertion; it
+would fail because none of the `find.text('Senior Flutter Developer')`
+finders resolve — those texts are only rendered by the `data:` branch,
+which never runs.** (In practice `flutter_test` also flags the
+unhandled `DioException` in stderr, which counts as a test error.)
+
+**What `overrideWith` does, in one sentence.** It replaces the
+constructor Riverpod uses to build the `JobsNotifier` for this
+`ProviderScope` — swapping in `_FakeJobsNotifier` — while leaving every
+widget, every derived provider (`filteredJobsProvider`,
+`visibleJobsProvider`, `savedJobsProvider`), and every filter/sort/search
+`StateProvider` completely untouched.
+
+**Single responsibility of the widget test.** _"When the app is handed a
+known list of jobs, it renders those jobs and reacts to filter/sort/search
+input correctly."_
+
+**Two things the widget test is explicitly NOT responsible for:**
+
+1. **HTTP wire-shape correctness** — does `JobsRepository.getJobs()`
+   correctly unwrap the `PagedResponse` envelope and produce
+   `List<Job>` from the API's real JSON? That is a **repository unit
+   test** with a Dio backed by `MockAdapter`, not a widget test.
+2. **End-to-end correctness against a running API** — does tapping a
+   card in the emulator open the correct detail screen with real data
+   from PostgreSQL? That is an **integration test** (or a manual
+   smoke test, which is what this assignment's Part 5 checkpoint
+   requires with the screenshots).
+
+---
+
+## Stretch A — Pull to refresh
+
+Added a `RefreshIndicator` around both the `ListView.builder` and the
+`GridView.builder` in `home_screen.dart`. Its `onRefresh` awaits
+`ref.read(jobsProvider.notifier).refresh()`.
+
+**What `invalidateSelf()` does.** It marks the notifier's cached value
+as stale and schedules a rebuild — the next `build()` invocation
+produces a fresh `Future`, and the notifier's `AsyncValue` transitions
+back into the `loading` state until that Future resolves.
+
+**Why `await future` is necessary after invalidating.** `future` is the
+notifier's currently-pending Future (the one the fresh `build()`
+produced). Awaiting it keeps `refresh()` suspended until the fetch
+finishes. **If `refresh()` returned immediately after `invalidateSelf()`
+without awaiting**, `RefreshIndicator` would see its `onRefresh` Future
+complete instantly, retract the spinner, and hand control back to the
+user — while the actual network fetch was still in flight. The user
+would think the refresh had failed to do anything, then a second later
+the list would visibly repopulate with no explanation. Awaiting the
+future keeps the spinner visible for exactly as long as the fetch takes.
+
+## Stretch B — Search by keyword
+
+The search box (from Assignment 1.4 Stretch C) already existed and is
+wired into `searchQueryProvider`, then composed with the two dropdown
+filters inside `visibleJobsProvider`. Selecting **Remote** + typing
+**"Devops"** applies both simultaneously — the derivation runs the
+filter first, then narrows the survivors by
+`Job.matches(searchQueryProvider)`.
+
+**Why `StateProvider`, not local `StatefulWidget` state?** Two reasons:
+
+1. **Cross-widget composition.** `visibleJobsProvider` — which lives one
+   layer above `HomeScreen` — needs to read the current query to
+   compute the visible list. Local widget state can only be read by
+   descendants of the widget that owns it, so it can never feed a
+   provider up-tree. Making the query a `StateProvider` puts it in the
+   reactive graph where anything can read it.
+2. **Independent addressability from tests.** The Assignment 2.1
+   widget test drives filtering by writing directly to
+   `locationFilterProvider.notifier.state` — no dropdown menu tap, no
+   overlay-based interaction. That only works because the state lives
+   in a provider container that the test can grab with
+   `ProviderScope.containerOf`. Local widget state is invisible to that
+   container.
+
+## Stretch C — Environment-aware base URL
+
+Added an `ENV` build variable (`--dart-define=ENV=dev|staging|prod`)
+alongside three URL variables (`API_BASE_URL`, `API_BASE_URL_STAGING`,
+`API_BASE_URL_PROD`). See `lib/data/jobs_repository.dart` — the
+`_resolvedBaseUrl` constant is a nested ternary over three
+compile-time `String.fromEnvironment` values, folded down by the Dart
+compiler into a single string literal at build time. No runtime `if`
+runs.
+
+**Why `String.fromEnvironment` values are compile-time constants and
+what that means for tree-shaking.** `String.fromEnvironment('X')` is a
+special-case expression that the Dart front-end resolves at COMPILATION
+time — the value passed via `--dart-define=X=...` is substituted for the
+expression before the ahead-of-time compiler ever sees it. Because the
+result is a `const String`, any `if (envName == 'prod')` guard where
+`envName` is also a compile-time constant is itself a constant expression
+— the compiler folds the whole ternary down, sees that (say) only
+`_envProdBaseUrl` survives, and tree-shakes the two unused URL constants
+out of the compiled binary entirely.
+
+**Why you cannot use `String.fromEnvironment` inside a conditional that
+reads a runtime variable.** Because it must be resolved at compile time,
+`String.fromEnvironment` **only produces a constant when its argument is
+itself a constant string literal**. If you wrote
+`String.fromEnvironment(someRuntimeVar)`, the argument is not known at
+compile time, so the expression is no longer constant — the compiler
+falls back to a runtime environment lookup on the target platform's
+process environment, which on Flutter's ahead-of-time-compiled release
+build is empty. You would get an empty string in production and no
+warning. The correct pattern is exactly what the file does: one const
+`fromEnvironment` per possible key, then a compile-time constant
+selector between them.
+
+---
+
+## Screenshots
+
+Place captured images under `screenshots/` and refer to them from here.
+If the images below render as broken, capture them by following the
+"How to test" section at the end of this file.
+
+**LogInterceptor output.** Terminal output during a fresh app load,
+showing the request line and 200 response for `GET /jobs`.
+
+![LogInterceptor terminal output](screenshots/loginterceptor.png)
+
+**Live jobs list.** The `HomeScreen` populated from the running
+CareerHub API.
+
+![Live jobs list](screenshots/live-jobs.png)
+
+**Error state.** The app after the API has been stopped (`Ctrl+C` on
+the `dotnet run` process) and the list re-fetched.
+
+![Error state](screenshots/error-state.png)
+
+**Filter preserved on back navigation.** A filter chip selected in the
+list, a card tapped, back pressed, filter still selected.
+
+![Filter preserved on back nav](screenshots/filter-preserved.png)
+
+**`flutter test` output.** `flutter test` reporting all tests passing
+against the fake notifier.
+
+![flutter test terminal output](screenshots/flutter-test.png)
+
+---
+
+## How to test (run-book)
+
+### A. Bring up the backend (terminal — happens outside Android Studio)
+
+1. **Wipe the old seed data.** The updated seed varies `Location` and
+   `Type`, but the seeder short-circuits when Companies already exist,
+   so old data must be dropped first. From `CareerHub/`:
+   ```sh
+   docker compose down -v
+   docker compose up -d
+   ```
+   The `-v` on `down` removes the Postgres volume so the next API
+   startup re-seeds from scratch.
+2. **Run the API.** From `CareerHub/`:
+   ```sh
+   dotnet run --project CareerHub.Api
+   ```
+   Expect it to listen on `http://localhost:5254` and log
+   `Seed completed successfully`. Leave this terminal open.
+
+### B. Prepare the Flutter project (Android Studio)
+
+3. **Open the project.** Android Studio → **File → Open…** →
+   `Bitcube/careerhub_mobile`. When the "Flutter commands" banner
+   appears at the top, click **Pub get**. (Same as running
+   `flutter pub get`, just via the UI.)
+4. **Run the code generator.** Android Studio does not have a
+   dedicated menu item for `build_runner`, so open its bottom
+   **Terminal** tab (**View → Tool Windows → Terminal**, or `⌥F12`),
+   confirm the working directory is `careerhub_mobile/`, and run:
+   ```sh
+   dart run build_runner build --delete-conflicting-outputs
+   ```
+   Expect two new files to appear in the Project view under
+   `lib/data/jobs_repository.g.dart` and
+   `lib/providers/jobs_notifier.g.dart`. Every red underline on
+   `_$JobsNotifier`, `dioProvider`, `jobsRepositoryProvider`, and
+   `jobsProvider` disappears the moment this command
+   completes.
+
+### C. Configure the run — the `--dart-define` flags and web port
+
+This project targets **Chrome (web)** for development — no Android
+emulator required. The web port must be pinned to `8080` because
+that's the origin the API's CORS policy allows.
+
+5. **Add the build arguments to the run configuration.**
+   - **Run → Edit Configurations…**
+   - Select the `main.dart` configuration (the default for a Flutter
+     project). If it does not exist, click **+ → Flutter** and point
+     it at `lib/main.dart`.
+   - In the **Additional run args** field, paste:
+     ```
+     --web-port=8080 --dart-define=ENV=dev --dart-define=API_BASE_URL=http://localhost:5254/api/v1
+     ```
+   - Click **Apply → OK**.
+
+### D. Pick the Chrome (web) device and launch
+
+6. **Select the device.** In Android Studio's top toolbar, open the
+   device dropdown (next to the Run button) and pick **Chrome (web)**.
+7. **Run the app.** Click the green **Run** ▶️ button (or press
+   **Ctrl+R** on macOS / **Shift+F10** on Windows/Linux). Android
+   Studio spins up the Flutter web dev-server on
+   `http://localhost:8080` and opens a Chrome window pointed at it.
+   The **Run** tool window at the bottom shows the `flutter run`
+   output; look for **two log blocks from `LogInterceptor`** — a
+   `*** Request ***` for `GET /jobs` and a `*** Response ***`
+   with status `200`.
+
+### E. Verify each Part-5 checkpoint (in Chrome)
+
+8. In the Chrome window that opened, walk through in order:
+   1. spinner appears immediately;
+   2. real job cards render with a mix of Remote, Hybrid, and
+      city-only locations;
+   3. picking **Remote** / **Hybrid** / **On-site** in the Location
+      dropdown narrows the list correctly;
+   4. picking a **Job type** narrows it further (combined
+      composition works);
+   5. tapping a card opens the detail screen with the full Guid
+      shown as "Listing ID";
+   6. pressing the browser back button returns to the list with the
+      filter dropdowns still selected;
+   7. clicking the **Saved** tab still works (empty state until you
+      bookmark from a detail screen);
+   8. **stop the API** — in the terminal running `dotnet run`, hit
+      `Ctrl+C` — and pull-to-refresh on the list (browser refresh,
+      or drag from the top on the list). The friendly "Something
+      went wrong" error state renders. No crash.
+
+### F. Take the five screenshots
+
+9. Save the five images into `careerhub_mobile/screenshots/` with
+   these exact filenames (the README already links to them):
+   - `loginterceptor.png` — Android Studio's **Run** tool window
+     showing a `*** Request ***` and `*** Response ***` block.
+   - `live-jobs.png` — the Chrome window with the populated list.
+   - `error-state.png` — the Chrome window with the API stopped and
+     the error state visible.
+   - `filter-preserved.png` — filter selected in the dropdown →
+     card tapped → back pressed → dropdown still on the same
+     selection.
+   - `flutter-test.png` — the Run tool window after step 10.
+
+### G. Run the widget test
+
+10. **Run the tests from the gutter.** Open
+    `test/widget_test.dart` in the editor. In the left gutter next to
+    `void main()` there is a green ▶️ arrow — click it and pick
+    **Run 'widget_test.dart'**. Alternatively, right-click
+    `test/widget_test.dart` in the Project view →
+    **Run 'widget_test.dart'**. The **Run** tool window shows the
+    test tree — every test node should be green.
+
+    Nothing in the test run touches the network: `_FakeJobsNotifier`
+    is swapped in via `ProviderScope.overrideWith` (see README, Q4).
 
 ---
 

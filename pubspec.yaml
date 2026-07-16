@@ -1,5 +1,5 @@
 name: careerhub_mobile
-description: "CareerHub — Week 1 Day 1: The Job Model & First Widget."
+description: "CareerHub — Week 2 Assignment 2.1: HTTP, Repositories & Code Generation."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -12,11 +12,32 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_riverpod: ^3.0.0
   go_router: ^17.3.0
+  # Assignment 2.1 — runtime HTTP client. Dio (not http) because we want
+  # interceptors (LogInterceptor for the terminal-visible request log the
+  # brief asks for), typed timeouts, and a BaseOptions we can hydrate from
+  # a compile-time env var. See README, Q2.
+  dio: ^5.7.0
+  # Assignment 2.1 — the tiny runtime annotation package the code
+  # generator reads to know which functions/classes to generate providers
+  # for. This is a plain runtime dep because the generated .g.dart files
+  # import it at runtime — the compile-time GENERATOR (riverpod_generator)
+  # is a dev_dependency below. See README, Q3.
+  riverpod_annotation: ^3.0.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # Assignment 2.1 — dev-only tools. These run under `dart run
+  # build_runner build` and produce lib/**/*.g.dart; they are NEVER part
+  # of the compiled app. That's why they live under dev_dependencies:
+  # ship the output, not the toolchain.
+  build_runner: ^2.4.13
+  riverpod_generator: ^3.0.0
+  # Riverpod 3's lint rules — surfaces `avoid_manual_providers_as_generated_provider_dependency`
+  # and friends. Runs under the same custom_lint host.
+  custom_lint: ^0.8.1
+  riverpod_lint: ^3.0.0
 
 flutter:
   uses-material-design: true

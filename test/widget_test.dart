@@ -4,64 +4,140 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:careerhub_mobile/main.dart';
 import 'package:careerhub_mobile/models/job.dart';
 import 'package:careerhub_mobile/providers/job_providers.dart';
+import 'package:careerhub_mobile/providers/jobs_notifier.dart';
 import 'package:careerhub_mobile/widgets/job_card.dart';
 import 'package:careerhub_mobile/widgets/icon_line.dart';
 import 'package:careerhub_mobile/widgets/empty_jobs_widget.dart';
 
-/// Assignment 1.4, Question 4 — the structural test change.
+/// Assignment 2.1, Part 6 — the fake notifier the widget tests use in
+/// place of the real, network-backed [JobsNotifier].
 ///
-/// The app is now MaterialApp.router, not MaterialApp with `home:`. That
-/// changes how the widget tree is resolved: instead of the test engine
-/// building a fixed `home` widget, GoRouter's RouterDelegate now decides
-/// what to build from `initialLocation`. Nothing is on screen until the
-/// router resolves a location. Our initialLocation is `/jobs`, so the app
-/// lands on the jobs list exactly where the pre-router assertions expect —
-/// so the job/spinner/chip assertions below need no rewriting for content,
-/// only the wrapper below.
+/// This class exists ONLY in the test file. The production
+/// [JobsNotifier] calls `JobsRepository.getJobs()`, which hits the
+/// CareerHub API. In `flutter test` no API is available, so `build()`
+/// would throw a `DioException` on `SocketException: OS Error:
+/// Connection refused` and every widget test would report an
+/// unhandled exception (see README, Q4). Overriding
+/// `jobsProvider` with a subclass of `_$JobsNotifier` swaps in
+/// a deterministic list of jobs, keeping the widget test focused on
+/// widget behaviour and NOT network behaviour.
 ///
-/// The one thing initialLocation alone can't satisfy is Stretch C's auth
-/// gate: isLoggedInProvider defaults to false, so the redirect would send a
-/// freshly-pumped app to /login instead of /jobs. Tests override it to true
-/// so we exercise the authenticated app the assertions were written for.
+/// The 1.5-second delay preserves the loading-state assertion from
+/// Assignment 1.3: the spinner must be visible for at least one frame
+/// before data arrives.
+class _FakeJobsNotifier extends JobsNotifier {
+  @override
+  Future<List<Job>> build() async {
+    await Future.delayed(const Duration(milliseconds: 1500));
+    return _fakeJobs;
+  }
+}
+
+/// The single source of truth for the tests in this file. Same shape
+/// and coverage as the pre-2.1 `_mockJobs` (four employment types,
+/// two remote roles, one closed role, mixed salary presence, etc.),
+/// but with String ids because [Job.id] is now a Guid string.
+final List<Job> _fakeJobs = [
+  Job(
+    id: 'fake-1',
+    title: 'Senior Flutter Developer',
+    company: 'Bitcube',
+    location: 'Cape Town, ZA',
+    locationType: LocationType.onSite,
+    salary: 'R55 000 – R75 000 per month',
+    employmentType: 'Full-time',
+    closingDate: DateTime(2026, 8, 15),
+    description: 'Build production-ready cross-platform apps.',
+    isOpen: true,
+  ),
+  Job(
+    id: 'fake-2',
+    title: 'Junior Backend Engineer',
+    company: 'Nimbus Systems',
+    location: 'Johannesburg, ZA',
+    locationType: LocationType.onSite,
+    employmentType: 'Full-time',
+    isOpen: true,
+  ),
+  Job.closed(
+    id: 'fake-3',
+    title: 'Product Designer',
+    company: 'Loop Studio',
+    location: 'Durban, ZA',
+    locationType: LocationType.onSite,
+    salary: 'R40 000 per month',
+    employmentType: 'Contract',
+    closingDate: DateTime(2026, 5, 1),
+    description: 'This role has closed for new applications.',
+  ),
+  Job.remote(
+    id: 'fake-4',
+    title: 'DevOps Engineer',
+    company: 'Skyforge',
+    salary: 'R60 000 – R80 000 per month',
+    employmentType: 'Full-time',
+    closingDate: DateTime(2026, 9, 30),
+    description: 'Fully remote infrastructure role.',
+    isOpen: true,
+  ),
+  Job(
+    id: 'fake-5',
+    title: 'UX Researcher',
+    company: 'Meridian Labs',
+    location: 'Pretoria, ZA',
+    locationType: LocationType.onSite,
+    salary: 'R48 000 – R58 000 per month',
+    employmentType: 'Full-time',
+    closingDate: DateTime(2026, 10, 1),
+    description: 'Lead user research sessions.',
+    isOpen: true,
+  ),
+  Job.remote(
+    id: 'fake-6',
+    title: 'Technical Support Engineer',
+    company: 'Fathom Analytics',
+    employmentType: 'Contract',
+    closingDate: DateTime(2026, 8, 20),
+    isOpen: true,
+  ),
+];
+
+/// Assignment 2.1 — the boot helper.
 ///
-/// Assignment 1.3's two fixes still apply and are unchanged in spirit:
-///  - ProviderScope wrapper (Consumer widgets need the ancestor), and
-///  - a deterministic time jump past jobsProvider's ~1.5s Future.delayed
-///    rather than pumpAndSettle().
+/// Two overrides:
+///   1. `jobsProvider` → `_FakeJobsNotifier` so no HTTP call
+///      ever leaves the test process (Part 6, and README Q4).
+///   2. `isLoggedInProvider` → true so the router's Stretch-C redirect
+///      allows the freshly-pumped app onto `/jobs` (unchanged from 1.4).
 Widget bootApp() {
   return ProviderScope(
-    // Stretch C: start authenticated so the redirect allows /jobs through.
-    overrides: [isLoggedInProvider.overrideWith((ref) => true)],
+    overrides: [
+      // `.overrideWith` on a generated notifier provider takes a
+      // notifier-CONSTRUCTOR — Riverpod calls it once per container to
+      // build the notifier instance, then invokes the instance's
+      // `build()` method to produce the initial value. This replaces
+      // ONLY the notifier; every widget, every derived provider
+      // ([filteredJobsProvider], [visibleJobsProvider],
+      // [savedJobsProvider]) still runs unchanged. See README, Q4.
+      jobsProvider.overrideWith(_FakeJobsNotifier.new),
+      isLoggedInProvider.overrideWith((ref) => true),
+    ],
     child: const CareerHubApp(),
   );
 }
 
-/// A tall, narrow default surface. Assignment 1.4 adds a persistent bottom
-/// NavigationBar, which eats vertical space that the job list used to have.
-/// On the small default 800x600 test surface that was enough to push the
-/// lower job cards out of the lazy-build window, so text-specific finders
-/// (e.g. find.text('Senior Flutter Developer')) saw zero matches even though
-/// the data was correct.
-///
-/// Width 500 keeps the app in the single-column ListView tier (< 600px),
-/// where each card is laid out at its natural height — so the richest cards
-/// (description + closing date) never overflow a fixed-aspect-ratio grid
-/// cell — and 3000px of height keeps all six cards built at once (dpr 1 so
-/// logical == physical). Tests that specifically need a grid tier pass their
-/// own [surface].
 const Size _defaultSurface = Size(500, 3000);
 
 Future<void> pumpLoadedApp(
   WidgetTester tester, {
   Size surface = _defaultSurface,
 }) async {
-  // Modern, non-deprecated viewport control (replaces window.*TestValue).
   tester.view.physicalSize = surface;
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
 
   await tester.pumpWidget(bootApp());
-  await tester.pump(); // build the first (loading) frame
+  await tester.pump(); // first frame — still loading
   await tester.pump(const Duration(seconds: 2)); // resolve the 1.5s delay
 }
 
@@ -74,11 +150,9 @@ void main() {
       expect(find.text('CareerHub'), findsWidgets);
     });
 
-    testWidgets('App bar displays on HomeScreen', (WidgetTester tester) async {
+    testWidgets('App bar displays on HomeScreen',
+        (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-      // Still findsOneWidget: StatefulShellRoute.indexedStack builds branches
-      // lazily, so the Saved branch (and its AppBar) is not instantiated
-      // until it is first visited — only the Jobs AppBar exists on launch.
       expect(find.byType(AppBar), findsOneWidget);
       expect(find.text('CareerHub'), findsWidgets);
     });
@@ -87,24 +161,16 @@ void main() {
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
-      // Assignment 1.4: the persistent shell renders a NavigationBar whose
-      // two destination labels are new text in the tree. These labels were
-      // chosen to NOT collide with any existing assertion — 'Jobs' and
-      // 'Saved' are not Job field values, filter labels, or card text — so
-      // no findsNWidgets count elsewhere needed adjusting.
       expect(find.byType(NavigationBar), findsOneWidget);
-      expect(find.widgetWithText(NavigationDestination, 'Jobs'), findsOneWidget);
-      expect(
-          find.widgetWithText(NavigationDestination, 'Saved'), findsOneWidget);
+      expect(find.widgetWithText(NavigationDestination, 'Jobs'),
+          findsOneWidget);
+      expect(find.widgetWithText(NavigationDestination, 'Saved'),
+          findsOneWidget);
     });
 
     testWidgets('Two filter dropdowns (Location and Job type) are present',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-      // The tutor-requested change: chips replaced with two typed
-      // dropdowns. Each is a DropdownButtonFormField, so we should find
-      // exactly two — and each shows its labelText as the field label
-      // in the tree (Location / Job type).
       expect(find.byType(DropdownButtonFormField<LocationType?>),
           findsOneWidget);
       expect(find.byType(DropdownButtonFormField<JobTypeFilter?>),
@@ -118,13 +184,12 @@ void main() {
     testWidgets('shows a CircularProgressIndicator before data loads',
         (WidgetTester tester) async {
       await tester.pumpWidget(bootApp());
-      await tester.pump(); // first frame only — jobsProvider still loading
+      await tester.pump(); // still loading (fake delay hasn't elapsed)
 
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       expect(find.byType(JobCard), findsNothing);
 
-      // Drain the pending timer so flutter_test doesn't report it as
-      // leaked when this test tears down.
+      // Drain the pending timer so flutter_test doesn't flag it.
       await tester.pump(const Duration(seconds: 2));
     });
 
@@ -140,90 +205,68 @@ void main() {
   group('Job List Rendering', () {
     testWidgets('ListView.builder renders job cards in portrait',
         (WidgetTester tester) async {
-      // Narrow (single-column ListView tier) but tall enough to build cards.
       await pumpLoadedApp(tester, surface: const Size(400, 2000));
-
-      // Six jobs total (the four from 1.1 + 2 added for Stretch B of 1.2)
       expect(find.byType(JobCard), findsWidgets);
-      // At least one card should be visible in portrait list
       expect(find.byType(Card), findsWidgets);
     });
 
-    testWidgets('All four original Job variants render correctly',
+    testWidgets('All variant jobs render correctly',
         (WidgetTester tester) async {
-      // The default tall single-column surface keeps all six cards built at
-      // once, so every one of the four variant jobs below is findable.
       await pumpLoadedApp(tester);
 
-      // Job 1: Fully populated
+      // Job 1: fully populated
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
-      expect(find.text('Bitcube'), findsWidgets); // Company + multiple places
+      expect(find.text('Bitcube'), findsWidgets);
       expect(find.text('R55 000 – R75 000 per month'), findsOneWidget);
 
-      // Job 2: No salary, no closing date (uses displaySalary).
+      // Job 2: no salary, no closing date (uses displaySalary).
       expect(find.text('Junior Backend Engineer'), findsOneWidget);
-      // Two jobs disclose no salary — Junior Backend Engineer AND Technical
-      // Support Engineer — so "Market-related" renders twice now that the
-      // tall surface builds every card at once. (Pre-1.4 this passed only
-      // because the smaller grid viewport left the second card unbuilt.)
+      // Two fake jobs disclose no salary — Junior Backend Engineer AND
+      // Technical Support Engineer.
       expect(find.text('Market-related'), findsNWidgets(2));
 
-      // Job 3: Closed job
+      // Job 3: closed job
       expect(find.text('Product Designer'), findsOneWidget);
       expect(find.text('Closed'), findsOneWidget);
 
-      // Job 4: Remote job
+      // Job 4: remote job
       expect(find.text('DevOps Engineer'), findsOneWidget);
-      expect(find.text('Remote'), findsWidgets); // Location + multiple places
+      expect(find.text('Remote'), findsWidgets);
     });
 
     testWidgets('Open badge shows "Open" for open jobs',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-
-      // At least 4 open jobs should show "Open" badges
       expect(find.text('Open'), findsWidgets);
     });
 
     testWidgets('Closed badge shows "Closed" for closed jobs',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-
-      // The closed job should show one "Closed" badge
       expect(find.text('Closed'), findsOneWidget);
     });
 
     testWidgets('jobs with no salary show "Market-related"',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-
-      // Both no-salary jobs (Junior Backend Engineer, Technical Support
-      // Engineer) display "Market-related" via displaySalary.
       expect(find.text('Market-related'), findsNWidgets(2));
     });
   });
 
   group('Reactive Filtering (dropdowns)', () {
-    // Helper: grab the running ProviderContainer so tests can drive filter
-    // state directly without having to open dropdown menus (which are an
-    // overlay-based interaction that's flaky to script). The dropdown UI
-    // wiring is proved by a dedicated "opens dropdown and picks Remote"
-    // test below; these two focus on the reactive filter behaviour.
     ProviderContainer containerFor(WidgetTester tester) =>
-        ProviderScope.containerOf(tester.element(find.byType(CareerHubApp)));
+        ProviderScope.containerOf(
+            tester.element(find.byType(CareerHubApp)));
 
     testWidgets('selecting a location filters out non-matching jobs',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-
-      // Before filtering: a non-remote job is visible.
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
 
       containerFor(tester).read(locationFilterProvider.notifier).state =
           LocationType.remote;
       await tester.pump();
 
-      // After filtering: only the two remote jobs remain.
       expect(find.text('Senior Flutter Developer'), findsNothing);
       expect(find.text('DevOps Engineer'), findsOneWidget);
       expect(find.text('Technical Support Engineer'), findsOneWidget);
@@ -239,13 +282,13 @@ void main() {
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsNothing);
 
-      // null == "All locations" — the dropdown's null-valued item.
       container.read(locationFilterProvider.notifier).state = null;
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
     });
 
-    testWidgets('the two dropdowns compose (Remote + Full-time narrows to '
+    testWidgets(
+        'the two dropdowns compose (Remote + Full-time narrows to '
         'the intersection)', (WidgetTester tester) async {
       await pumpLoadedApp(tester);
       final container = containerFor(tester);
@@ -256,8 +299,8 @@ void main() {
           JobTypeFilter.fullTime;
       await tester.pump();
 
-      // Only DevOps Engineer is BOTH remote AND full-time — Technical
-      // Support Engineer is remote but contract, so it drops out.
+      // Only DevOps Engineer is BOTH remote AND full-time in the fake
+      // data — Technical Support Engineer is remote but contract.
       expect(find.text('DevOps Engineer'), findsOneWidget);
       expect(find.text('Technical Support Engineer'), findsNothing);
       expect(find.text('Senior Flutter Developer'), findsNothing);
@@ -270,15 +313,10 @@ void main() {
       final container = containerFor(tester);
       expect(container.read(locationFilterProvider), isNull);
 
-      // Open the Location dropdown (typed generically so it matches
-      // regardless of which item is currently selected).
       await tester
           .tap(find.byType(DropdownButtonFormField<LocationType?>));
       await tester.pumpAndSettle();
 
-      // Now the menu is in an overlay. Tap the "Remote" menu item. The
-      // overlay is inserted at the END of the tree, so `.last` targets
-      // the menu row rather than a job-card location text.
       await tester.tap(find.text('Remote').last);
       await tester.pumpAndSettle();
 
@@ -287,18 +325,11 @@ void main() {
     });
   });
 
-  group('Stretch Goals (Assignment 1.3)', () {
-    testWidgets('sort menu reverses job order (Stretch A)',
+  group('Sort + Search', () {
+    testWidgets('sort menu reverses job order',
         (WidgetTester tester) async {
-      // This test reasons about horizontal position (dx), so it needs the
-      // two-column GRID tier, not the single-column list. Width 800 sits in
-      // the 2-column band (600–839px) and gives cells wide enough that the
-      // richest card doesn't overflow its fixed-ratio cell.
       await pumpLoadedApp(tester, surface: const Size(800, 1400));
 
-      // Narrow to the two remote jobs so there are only two candidates
-      // to reason about the order of. Drive the filter provider directly
-      // (dropdown UI is exercised in the Reactive Filtering group).
       final container = ProviderScope.containerOf(
           tester.element(find.byType(CareerHubApp)));
       container.read(locationFilterProvider.notifier).state =
@@ -307,9 +338,6 @@ void main() {
 
       double dxOf(String title) => tester.getTopLeft(find.text(title)).dx;
 
-      // Default sort is A -> Z: "DevOps Engineer" sorts before
-      // "Technical Support Engineer", landing in the earlier grid cell
-      // (smaller dx).
       expect(dxOf('DevOps Engineer'),
           lessThan(dxOf('Technical Support Engineer')));
 
@@ -322,32 +350,7 @@ void main() {
           lessThan(dxOf('DevOps Engineer')));
     });
 
-    testWidgets(
-        'failure toggle shows the error state; tapping again recovers '
-        '(Stretch B)', (WidgetTester tester) async {
-      await pumpLoadedApp(tester);
-      expect(find.byType(JobCard), findsWidgets);
-
-      // First tap: turns the simulated failure ON and retries.
-      await tester.tap(find.byIcon(Icons.wifi));
-      await tester.pump();
-      await tester.pump(const Duration(seconds: 2));
-
-      expect(find.text('Something went wrong'), findsOneWidget);
-      expect(find.byType(JobCard), findsNothing);
-
-      // Second tap (on the now-different icon): turns the simulated
-      // failure back OFF and retries again — this is the attempt that
-      // succeeds.
-      await tester.tap(find.byIcon(Icons.wifi_off));
-      await tester.pump();
-      await tester.pump(const Duration(seconds: 2));
-
-      expect(find.text('Something went wrong'), findsNothing);
-      expect(find.byType(JobCard), findsWidgets);
-    });
-
-    testWidgets('search field filters jobs by title (Stretch C)',
+    testWidgets('search field filters jobs by title',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
@@ -362,11 +365,49 @@ void main() {
     });
   });
 
+  group('Job.fromDto mapping (Assignment 2.1)', () {
+    test('inferLocationType maps "Remote" strings to remote', () {
+      expect(Job.inferLocationType('Remote'), LocationType.remote);
+      expect(Job.inferLocationType('remote'), LocationType.remote);
+      expect(Job.inferLocationType('Fully remote (SA)'),
+          LocationType.remote);
+    });
+
+    test('inferLocationType maps "Hybrid" strings to hybrid', () {
+      expect(Job.inferLocationType('Hybrid'), LocationType.hybrid);
+      expect(Job.inferLocationType('Cape Town (Hybrid)'),
+          LocationType.hybrid);
+    });
+
+    test('inferLocationType defaults to onSite for a plain city string',
+        () {
+      expect(Job.inferLocationType('Cape Town, ZA'), LocationType.onSite);
+      expect(Job.inferLocationType('Johannesburg'), LocationType.onSite);
+    });
+
+    test('displaySalary renders "Market-related" when the API sent the '
+        '"Salary not specified" sentinel', () {
+      // Reproduces what Job.fromDto builds when the API returns
+      // "Salary not specified" — salary is mapped to null so
+      // displaySalary yields "Market-related".
+      final job = Job(
+        id: 'x',
+        title: 't',
+        company: 'c',
+        location: 'l',
+        locationType: LocationType.onSite,
+        employmentType: 'Full-time',
+        // salary intentionally omitted (== null)
+      );
+      expect(job.displaySalary, 'Market-related');
+    });
+  });
+
   group('JobCard Widget', () {
     testWidgets('JobCard renders all required fields',
         (WidgetTester tester) async {
       final testJob = Job(
-        id: 101,
+        id: 'j-101',
         title: 'Test Developer',
         company: 'Test Corp',
         location: 'Test City',
@@ -387,15 +428,14 @@ void main() {
       expect(find.text('Test Corp'), findsOneWidget);
       expect(find.text('Test City'), findsOneWidget);
       expect(find.text('Full-time'), findsOneWidget);
-      expect(find.text('Market-related'), findsOneWidget); // No salary provided
-      expect(find.text('Open'), findsOneWidget); // Status badge
+      expect(find.text('Market-related'), findsOneWidget);
+      expect(find.text('Open'), findsOneWidget);
     });
 
     testWidgets('JobCard handles nullable fields gracefully',
         (WidgetTester tester) async {
-      // Job with all nullable fields absent
       final minimalJob = Job(
-        id: 102,
+        id: 'j-102',
         title: 'Minimal Job',
         company: 'Company',
         location: 'Somewhere',
@@ -412,14 +452,13 @@ void main() {
       );
 
       expect(find.text('Minimal Job'), findsOneWidget);
-      // No crash, no "null" text, closing date line should not appear
       expect(find.text('Closes:'), findsNothing);
     });
 
     testWidgets('JobCard shows description when present',
         (WidgetTester tester) async {
       final jobWithDesc = Job(
-        id: 103,
+        id: 'j-103',
         title: 'Job with Description',
         company: 'Company',
         location: 'Location',
@@ -503,7 +542,6 @@ void main() {
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
-      // The app should have both light and dark themes defined
       final materialApp = find.byType(MaterialApp).evaluate().first.widget
           as MaterialApp;
       expect(materialApp.theme, isNotNull);
@@ -514,7 +552,7 @@ void main() {
     testWidgets('JobCard renders correctly in light mode',
         (WidgetTester tester) async {
       final testJob = Job(
-        id: 104,
+        id: 'j-104',
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
@@ -539,7 +577,7 @@ void main() {
     testWidgets('JobCard renders correctly in dark mode',
         (WidgetTester tester) async {
       final testJob = Job(
-        id: 105,
+        id: 'j-105',
         title: 'Test Job',
         company: 'Test Co',
         location: 'Test Place',
