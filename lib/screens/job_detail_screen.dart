@@ -12,9 +12,13 @@ import '../widgets/job_status_badge.dart';
 /// Assignment 2.1 changes:
 ///   - `jobId` is now `String?` (was `int?`), because [Job.id] is now
 ///     the API's Guid string.
-///   - watches [jobsProvider] (was `jobsProvider`) — the
-///     AsyncValue shape is identical, so the three-state `when` below
-///     is unchanged.
+///   - watches [jobsProvider] (was `jobsProvider`) — the AsyncValue
+///     shape is identical, so the three-state `when` below is unchanged.
+///
+/// Assignment 2.2 (Stretch B) — the detail body renders a note field
+/// wired to [editedJobProvider]. Typing produces a `copyWith`ed `Job`
+/// stored in the StateProvider; the original `Job` in the list is
+/// never mutated. See README 2.2, Stretch B.
 class JobDetailScreen extends ConsumerWidget {
   /// Nullable because the URL segment may be absent (e.g. an empty
   /// `/jobs/` — impossible via canonical routing but possible via a
@@ -27,16 +31,13 @@ class JobDetailScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     // Watch the RAW, unfiltered notifier — not visibleJobsProvider or
     // filteredJobsProvider — because a job's identity must not depend on
-    // whether it currently passes the list screen's active filter/search:
-    // /jobs/<id> has to resolve even when the "Remote" filter is hiding
-    // that job from the list the user navigated away from.
+    // whether it currently passes the list screen's active filter/search.
     final jobsAsync = ref.watch(jobsProvider);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Job details'),
       ),
-      // Handle all three AsyncValue states explicitly.
       body: jobsAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (error, stackTrace) => _DetailError(
@@ -76,6 +77,16 @@ class _JobDetailBody extends ConsumerWidget {
 
     final savedIds = ref.watch(savedJobIdsProvider);
     final isSaved = savedIds.contains(job.id);
+
+    // Stretch B — the EDITED copy, if any. The provider is a
+    // `StateProvider<Job?>`; we only treat it as "mine" when its `id`
+    // matches this screen's `job.id`. That way navigating between
+    // detail screens for different jobs starts each one at the
+    // original API value (userNote == '') rather than leaking a note
+    // from the previous screen.
+    final editedJob = ref.watch(editedJobProvider);
+    final effectiveJob =
+        (editedJob != null && editedJob.id == job.id) ? editedJob : job;
 
     return ListView(
       padding: const EdgeInsets.all(20),
@@ -125,9 +136,6 @@ class _JobDetailBody extends ConsumerWidget {
               : 'Applications closed',
         ),
         const SizedBox(height: 8),
-        // The stable id — surfaced so the URL/deep-link story is visible.
-        // A Guid is long, so give it its own line rather than fighting the
-        // trailing IconLine's overflow rules.
         IconLine(icon: Icons.tag, text: 'Listing ID: ${job.id}'),
 
         const SizedBox(height: 24),
@@ -144,6 +152,59 @@ class _JobDetailBody extends ConsumerWidget {
               ? job.description!
               : 'No description was provided for this listing yet.',
           style: theme.textTheme.bodyLarge,
+        ),
+
+        const SizedBox(height: 24),
+
+        // ────────────────────────────────────────────────────────────────
+        // Stretch B — the note field.
+        //
+        // Every keystroke produces a NEW `Job` via Freezed's generated
+        // `copyWith(userNote: text)` and stores it in
+        // `editedJobProvider`. The `job` we render the header from is
+        // still the ORIGINAL passed into this widget, so the list
+        // upstream sees no mutation. The bottom "Debug" line reads
+        // both values so the effect is visible in the running app.
+        // ────────────────────────────────────────────────────────────────
+        Text(
+          'Your notes',
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'These notes stay on your device only.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: scheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        TextFormField(
+          initialValue: effectiveJob.userNote,
+          key: ValueKey('user-note-${job.id}'),
+          maxLines: 3,
+          decoration: InputDecoration(
+            hintText: 'e.g. Reminded me of the Bitcube role — follow up next week.',
+            border: const OutlineInputBorder(),
+            filled: true,
+            fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+          ),
+          onChanged: (text) {
+            // Freezed's generated copyWith — the ORIGINAL `job` is
+            // never mutated; we produce a new instance and stash it
+            // in the StateProvider.
+            ref.read(editedJobProvider.notifier).state =
+                job.copyWith(userNote: text);
+          },
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Original note in list: "${job.userNote}"   ·   '
+          'Edited note here: "${effectiveJob.userNote}"',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: scheme.onSurfaceVariant,
+          ),
         ),
 
         const SizedBox(height: 28),

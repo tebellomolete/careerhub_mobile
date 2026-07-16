@@ -26,7 +26,6 @@ import 'jobs_notifier.dart';
 
 /// ---------------------------------------------------------------------
 /// Provider 2a — the currently selected LOCATION filter dropdown value.
-/// See job_providers.dart's Assignment 1.4 history for the design rationale.
 /// ---------------------------------------------------------------------
 final locationFilterProvider =
     StateProvider<LocationType?>((ref) => null);
@@ -54,13 +53,6 @@ final jobTypeFilterProvider =
 /// ---------------------------------------------------------------------
 /// Provider 3 — the filtered job list, derived from the async job list
 /// plus the two dropdown filters.
-///
-/// Assignment 2.1: this now watches [jobsProvider] instead of
-/// the deleted `jobsProvider`. Nothing else about the derivation
-/// changed — the filtered/searched/sorted stack still composes
-/// downstream, and the widget layer's `AsyncValue.when` handling still
-/// works because the notifier's value shape (`AsyncValue<List<Job>>`)
-/// is identical.
 /// ---------------------------------------------------------------------
 final filteredJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
   final jobsAsync = ref.watch(jobsProvider);
@@ -89,12 +81,6 @@ final sortOrderProvider = StateProvider<SortOrder>((ref) => SortOrder.aToZ);
 
 /// ---------------------------------------------------------------------
 /// Stretch B (Assignment 2.1) / Stretch C (Assignment 1.3) — search box text.
-///
-/// Kept as a StateProvider (not local widget state) so the search is
-/// available to any consumer transitively — the visible-jobs derivation
-/// below, a future analytics event, and the widget test's assertions
-/// can all read it from the container without walking the widget tree.
-/// See README Stretch B for the full argument.
 /// ---------------------------------------------------------------------
 final searchQueryProvider = StateProvider<String>((ref) => '');
 
@@ -119,11 +105,6 @@ final visibleJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
 
 /// ---------------------------------------------------------------------
 /// Assignment 1.4 — the set of job ids the user has saved.
-///
-/// Assignment 2.1: `Set<int>` → `Set<String>` because [Job.id] is now a
-/// String (the API's Guid). The invariant is unchanged: save by ID, not
-/// by object reference, so a re-fetch of the job list never pins a
-/// stale copy of a job's fields.
 /// ---------------------------------------------------------------------
 final savedJobIdsProvider = StateProvider<Set<String>>((ref) => <String>{});
 
@@ -141,3 +122,24 @@ final savedJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
 /// Stretch C (Assignment 1.4) — authentication state. Unchanged from 1.4.
 /// ---------------------------------------------------------------------
 final isLoggedInProvider = StateProvider<bool>((ref) => false);
+
+/// ---------------------------------------------------------------------
+/// Stretch B (Assignment 2.2) — the user's IN-PROGRESS edited copy of
+/// the currently-viewed job.
+///
+/// The value is a `Job?` — `null` when no note has been typed for the
+/// current detail-screen visit, otherwise a `Job` produced by
+/// `original.copyWith(userNote: text)`.
+///
+/// The IMPORTANT thing about this provider is what it does NOT do:
+/// it does NOT replace the job in the list. The [jobsProvider]'s
+/// `List<Job>` remains untouched — Freezed's `copyWith` returns a NEW
+/// `Job` instance, and we store that new instance HERE rather than
+/// mutating the original. The list is source-of-truth for what the
+/// server sent; this provider is source-of-truth for what the user
+/// has typed. See README 2.2, Stretch B.
+///
+/// Simple key-off-of-id contract: the detail screen only treats the
+/// value as "mine" when `edited.id == job.id`. Navigating to a
+/// different job renders the original API `Job` until the user types.
+final editedJobProvider = StateProvider<Job?>((ref) => null);

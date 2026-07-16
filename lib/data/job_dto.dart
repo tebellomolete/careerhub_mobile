@@ -1,103 +1,107 @@
-/// Assignment 2.1 — the wire-shape mirror of the CareerHub API's
-/// `JobResponse` record (see CareerHub.Api/DTOs/JobResponse.cs).
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+// Assignment 2.2, Part 4 — the two part directives freezed +
+// json_serializable each require. `job_dto.freezed.dart` holds the
+// mixin containing `==`, `hashCode`, `copyWith`, and `toString`;
+// `job_dto.g.dart` holds `_$JobDtoFromJson` and `_$JobDtoToJson`,
+// which the fromJson factory below delegates to.
+//
+// Both files are produced by `dart run build_runner build
+// --delete-conflicting-outputs` and MUST NOT be edited by hand. Until
+// the generator has run at least once, the IDE will show red underlines
+// on these two `part` lines and on `_$JobDto`, `_JobDto`, and the
+// generated function names below. That is expected. See README 2.2, Q3.
+part 'job_dto.freezed.dart';
+part 'job_dto.g.dart';
+
+/// Assignment 2.1 → 2.2 — the wire-shape mirror of the CareerHub API's
+/// `JobResponse` record (see `CareerHub.Api/DTOs/JobResponse.cs`).
 ///
 /// The DTO is deliberately a 1:1 mirror of the API JSON:
-///   - field NAMES match the API exactly (companyName, salaryDisplay,
-///     postedAt, applicationCount) — this is the ONLY place in the app
+///   - field NAMES match the API exactly (`companyName`, `salaryDisplay`,
+///     `postedAt`, `applicationCount`) — this is the ONLY place in the app
 ///     that ever spells those names,
-///   - field TYPES match how System.Text.Json serialises the C# record
-///     (Guid → String, JobType → enum-string, DateTime → ISO-8601 String).
+///   - field TYPES match how `System.Text.Json` serialises the C# record
+///     (`Guid` → `String`, `JobType` → enum-string, `DateTime` →
+///     ISO-8601 `String`).
 ///
-/// The DTO captures EVERY field the API returns — including
-/// `postedAt` and `applicationCount`, which the Flutter `Job` model does
-/// not currently display. Capturing them here is deliberate: the field
-/// list is dirt-cheap to type in this file, and having the wire
-/// representation complete means a UI story six months from now
-/// ("show me the number of applicants on the card") is a one-line
-/// mapping in `Job.fromDto`, not a DTO change + a regeneration + a code
-/// review. See README, Q1.
+/// Assignment 2.2 changes:
+///   - `class JobDto { ... }` (plain Dart class) is now
+///     `@freezed class JobDto with _$JobDto { ... }` — the `==`,
+///     `hashCode`, `copyWith`, and `toString` are supplied by the
+///     generated mixin, and `fromJson` delegates to the
+///     `json_serializable`-generated function in `job_dto.g.dart`.
+///   - The hand-written `factory JobDto.fromJson(json) { ... }` body is
+///     gone — Freezed + json_serializable read the field declarations
+///     below to write it for us. See README 2.2, Q2.
 ///
 /// This class has NO knowledge of the `Job` model, NO Riverpod, and NO
 /// Dio import. It is a data-shape only.
-class JobDto {
-  /// The API's primary key is a `Guid`, serialised as a lowercase-hex
-  /// string like `"6e8d9f34-..."`. It travels through the app as a
-  /// String and is used verbatim as the URL path segment for `/jobs/:id`.
-  final String id;
+@freezed
+sealed class JobDto with _$JobDto {
+  /// The single `const factory` constructor is what Freezed reads to
+  /// generate the private implementation class `_JobDto`, the equality,
+  /// and `copyWith`. Because every field is `final` and the constructor
+  /// is `const`, `JobDto` is immutable AND canonicalisable — two DTOs
+  /// with the same field values compare equal by value, not identity.
+  const factory JobDto({
+    /// The API's primary key is a `Guid`, serialised as a lowercase-hex
+    /// string like `"6e8d9f34-..."`. It travels through the app as a
+    /// `String` and is used verbatim as the URL path segment for
+    /// `/jobs/:id`. The JSON key is `id`, which matches the Dart field
+    /// name — no `@JsonKey(name: ...)` needed.
+    required String id,
+    required String title,
 
-  final String title;
+    /// API JSON key: `companyName`. Flutter's `Job` model calls this
+    /// `company` — the rename lives in `Job.fromDto`, not here.
+    /// The Dart field name and JSON key already match, so no
+    /// `@JsonKey(name: ...)` override is required. See README 2.2, Q2.
+    required String companyName,
+    required String location,
 
-  /// The API's spelling: `companyName`. The Flutter model calls this
-  /// `company` — the rename lives in `Job.fromDto`, not here. See README, Q1.
-  final String companyName;
+    /// The API returns a description string on the list endpoint too, so
+    /// we can capture it eagerly rather than making a second call per card.
+    /// `@Default('')` reproduces the previous hand-written tolerance
+    /// for a missing `description` key: Freezed forwards the default
+    /// through both `JobDto()` construction AND
+    /// `json_serializable`'s generated `fromJson`, so a missing key
+    /// yields `''` instead of a runtime type error.
+    @Default('') String description,
 
-  final String location;
+    /// The API's `JobType` enum comes over as a Pascal-cased String
+    /// (`"FullTime"`, `"PartTime"`, `"Contract"`, `"Internship"`) thanks
+    /// to `JsonStringEnumConverter` in `Program.cs`. Kept as the raw
+    /// string here; the Flutter-friendly re-hyphenation ("Full-time")
+    /// is a concern of `Job.fromDto`.
+    required String type,
 
-  /// The API returns a description string on the list endpoint too, so
-  /// we can capture it eagerly rather than making a second call per card.
-  final String description;
+    /// ISO-8601 date-time. Kept as `String` on the DTO because the DTO's
+    /// only job is to mirror the wire shape faithfully — parsing to
+    /// `DateTime` is a modelling decision that belongs on the way OUT of
+    /// the DTO, not here.
+    required String postedAt,
 
-  /// The API's `JobType` enum comes over as a Pascal-cased String —
-  /// `"FullTime"`, `"PartTime"`, `"Contract"`, `"Internship"` — thanks
-  /// to `JsonStringEnumConverter` in Program.cs. Kept as the raw string
-  /// here; the Flutter-friendly re-hyphenation ("Full-time") is a
-  /// concern of `Job.fromDto`.
-  final String type;
+    /// A pre-formatted display string. When the employer omitted salary
+    /// entirely the API sends the literal `"Salary not specified"` (see
+    /// `JobResponse.FromListing`). The Flutter model prefers `null` for
+    /// that case so `Job.displaySalary` can render "Market-related";
+    /// that translation happens in `Job.fromDto`.
+    required String salaryDisplay,
 
-  /// ISO-8601 date-time. Kept as String on the DTO because the DTO's
-  /// only job is to mirror the wire shape faithfully — parsing to
-  /// `DateTime` is a modelling decision that belongs on the way OUT of
-  /// the DTO, not here.
-  final String postedAt;
+    /// Not currently rendered by any Flutter widget — captured anyway so
+    /// the DTO stays a complete mirror of the API. `@Default(0)` keeps
+    /// this tolerant of an older API build that omitted the key.
+    @Default(0) int applicationCount,
+  }) = _JobDto;
 
-  /// A pre-formatted display string. When the employer omitted salary
-  /// entirely, the API sends the literal string `"Salary not specified"`
-  /// (see `JobResponse.FromListing`). The Flutter model prefers `null`
-  /// for that case so `Job.displaySalary` can render "Market-related";
-  /// that translation happens in `Job.fromDto`.
-  final String salaryDisplay;
-
-  /// Not currently rendered by any Flutter widget — captured anyway so
-  /// the DTO stays a complete mirror of the API. See the class-level
-  /// note above and README Q1.
-  final int applicationCount;
-
-  const JobDto({
-    required this.id,
-    required this.title,
-    required this.companyName,
-    required this.location,
-    required this.description,
-    required this.type,
-    required this.postedAt,
-    required this.salaryDisplay,
-    required this.applicationCount,
-  });
-
-  /// Reads the raw JSON map produced by Dio's default JSON decoder.
-  /// Field names here MUST match the API's casing — because System.Text
-  /// .Json's default policy in ASP.NET Core is camelCase, the wire
-  /// spelling of `Id` is `id`, `CompanyName` is `companyName`, etc.
-  ///
-  /// Uses `as` casts (not `as?`) for required fields: a malformed
-  /// response should throw loudly and let the AsyncNotifier's error
-  /// state surface it, not silently produce a half-populated DTO with
-  /// empty strings that the UI would render as blanks.
-  factory JobDto.fromJson(Map<String, dynamic> json) {
-    return JobDto(
-      id: json['id'] as String,
-      title: json['title'] as String,
-      companyName: json['companyName'] as String,
-      location: json['location'] as String,
-      // `description` is non-nullable on the C# record, but the DB
-      // column is `string.Empty` by default — coerce a missing key to
-      // empty rather than throwing, since an empty description is a
-      // valid domain state that `Job.description` already handles.
-      description: (json['description'] as String?) ?? '',
-      type: json['type'] as String,
-      postedAt: json['postedAt'] as String,
-      salaryDisplay: json['salaryDisplay'] as String,
-      applicationCount: (json['applicationCount'] as num?)?.toInt() ?? 0,
-    );
-  }
+  /// The one-line delegation the whole conversion is aimed at. The
+  /// generator produces `_$JobDtoFromJson` in `job_dto.g.dart` by
+  /// reading the field declarations above and calling the appropriate
+  /// `as`-cast / `DateTime.parse` / `int.parse` per type. Renaming or
+  /// re-typing any field above regenerates this function automatically
+  /// on the next `build_runner` run — no hand-written parse code to
+  /// forget to update. See README 2.2, Q2.
+  factory JobDto.fromJson(Map<String, dynamic> json) =>
+      _$JobDtoFromJson(json);
 }

@@ -1,5 +1,5 @@
 name: careerhub_mobile
-description: "CareerHub — Week 2 Assignment 2.1: HTTP, Repositories & Code Generation."
+description: "CareerHub — Week 2 Assignment 2.2: Immutable Models, Dart 3 & Freezed."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -23,6 +23,16 @@ dependencies:
   # import it at runtime — the compile-time GENERATOR (riverpod_generator)
   # is a dev_dependency below. See README, Q3.
   riverpod_annotation: ^3.0.0
+  # Assignment 2.2 — the two RUNTIME annotation packages. `freezed_annotation`
+  # supplies the `@freezed`, `@Default`, `@JsonKey`-adjacent metadata that
+  # the generated `*.freezed.dart` file imports at runtime. `json_annotation`
+  # supplies the `@JsonKey`, `@JsonSerializable`, and helpers that the
+  # generated `*.g.dart` file imports at runtime. Both must live in the
+  # runtime `dependencies:` section because the generated files that ship
+  # with the app import them; the GENERATORS themselves (freezed,
+  # json_serializable) are dev-only. See README 2.2, Q2.
+  freezed_annotation: ^3.0.0
+  json_annotation: ^4.9.0
 
 dev_dependencies:
   flutter_test:
@@ -38,6 +48,13 @@ dev_dependencies:
   # and friends. Runs under the same custom_lint host.
   custom_lint: ^0.8.1
   riverpod_lint: ^3.0.0
+  # Assignment 2.2 — dev-only code generators. `freezed` emits the
+  # `*.freezed.dart` mixin (with ==, hashCode, copyWith, toString);
+  # `json_serializable` emits the `*.g.dart` file with the
+  # `_$JobDtoFromJson` / `_$JobDtoToJson` functions. Neither ships in the
+  # compiled app — only the generated Dart source they produce does.
+  freezed: ^3.0.0
+  json_serializable: ^6.9.0
 
 flutter:
   uses-material-design: true
