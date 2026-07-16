@@ -31,7 +31,13 @@ class AppRoutes {
   /// Builds the canonical detail URL for a job id — the ONLY way the app
   /// constructs `/jobs/:id`, so `job.id` (never a list index) is always
   /// what ends up in the URL.
-  static String jobDetail(int id) => '$jobs/$id';
+  ///
+  /// Assignment 2.1: `int` → `String`. `Job.id` is now a Guid string
+  /// (see `Job.fromDto`), and Guids are safe to drop directly into a
+  /// URL path segment — they contain only hex digits and hyphens, all
+  /// of which are unreserved characters, so no percent-encoding is
+  /// required at the call site.
+  static String jobDetail(String id) => '$jobs/$id';
 }
 
 final goRouterProvider = Provider<GoRouter>((ref) {
@@ -107,13 +113,16 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                     // Relative path -> full URL is /jobs/:id.
                     path: ':id',
                     builder: (context, state) {
-                      // Parse the id from the URL. tryParse returns null for
-                      // a non-numeric segment (e.g. /jobs/abc); the detail
-                      // screen renders a graceful "not found" for a null id.
-                      final id = int.tryParse(
-                        state.pathParameters['id'] ?? '',
+                      // Assignment 2.1: Job.id is a Guid string, so we
+                      // pass the raw path segment straight through. An
+                      // empty segment (impossible via canonical routing
+                      // but possible via a malformed URL) resolves to
+                      // null and the detail screen renders the graceful
+                      // "not found" state.
+                      final rawId = state.pathParameters['id'];
+                      return JobDetailScreen(
+                        jobId: (rawId == null || rawId.isEmpty) ? null : rawId,
                       );
-                      return JobDetailScreen(jobId: id);
                     },
                   ),
                 ],
