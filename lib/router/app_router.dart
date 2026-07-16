@@ -7,6 +7,7 @@ import '../screens/home_screen.dart';
 import '../screens/job_detail_screen.dart';
 import '../screens/saved_screen.dart';
 import '../screens/login_screen.dart';
+import '../screens/applications_screen.dart';
 import '../widgets/scaffold_with_nav_bar.dart';
 
 /// ---------------------------------------------------------------------
@@ -27,6 +28,7 @@ class AppRoutes {
   static const String jobs = '/jobs';
   static const String saved = '/saved';
   static const String login = '/login';
+  static const String applications = '/applications';
 
   /// Builds the canonical detail URL for a job id — the ONLY way the app
   /// constructs `/jobs/:id`, so `job.id` (never a list index) is always
