@@ -2173,3 +2173,68 @@ after tapping Log In (no `context.go` in the login screen):*
 
 ![Login screen](screenshots/1_4_stretchC_login.png)
 ![Auto-redirected to jobs after login](screenshots/1_4_stretchC_after_login.png)
+
+---
+
+## Week 2 Day 3 In-Class Challenge — Job Application Tracker
+
+A new **Applications** tab on the bottom navigation showing the current
+user's submitted job applications. Offline-capable: the list is cached
+locally in Isar, an offline banner appears automatically when
+connectivity is lost, and a persisted status filter narrows the list to
+one lifecycle stage at a time.
+
+### Folder layout (files added)
+
+Matches the existing layer-first convention — files are placed by
+responsibility, not by feature.
+
+| Layer            | File                                                         | Role                                                            |
+| ---------------- | ------------------------------------------------------------ | --------------------------------------------------------------- |
+| `models/`        | `job_application.dart`                                       | Freezed domain model + `ApplicationStatus` enum                 |
+| `data/`          | `job_application_dto.dart`                                   | Freezed + json_serializable wire-shape                          |
+| `data/`          | `job_application_isar.dart`                                  | Isar collection (separate from domain), status stored as string |
+| `data/`          | `applications_repository.dart`                               | Constructor-injected Dio + Isar; `readCache` and `fetchAndCache`|
+| `providers/`     | `persistence_providers.dart`                                 | Placeholder `isarProvider` + `sharedPreferencesProvider` overridden in `main` |
+| `providers/`     | `connectivity_provider.dart`                                 | `StreamProvider` around `connectivity_plus`, derived `isOfflineProvider`      |
+| `providers/`     | `applications_notifier.dart`                                 | `@riverpod` AsyncNotifier (cache-then-network), filter Notifier, derived filtered + last-synced providers |
+| `screens/`       | `applications_screen.dart` / `application_detail_screen.dart`| ConsumerWidgets — list (responsive) and detail (stretch)        |
+| `widgets/`       | `application_card.dart` / `application_status_badge.dart`    | StatelessWidgets — no `ref.watch`; badge uses exhaustive switch |
+
+### Provider graph
+
+```
+dioProvider ──────────────┐
+                          ├──▶ applicationsRepositoryProvider ──▶ applicationsProvider (AsyncNotifier)
+isarProvider (override) ──┘                                                │
+                                                                           │
+sharedPreferencesProvider (override) ──▶ applicationFilterProvider ────────┤
+                                                                           ▼
+connectivity_plus stream ──▶ connectivityStreamProvider ─┐         filteredApplicationsProvider  ◀── UI
+                                                         └─▶ isOfflineProvider ─▶ offline banner
+```
+
+### How cache-then-network works
+
+1. `ApplicationsNotifier.build()` calls `repo.readCache()` first — a pure Isar read, no HTTP.
+2. If the cache is non-empty, `state = AsyncData(cached)` fires immediately, so the ListView renders on the first frame the notifier is watched.
+3. `repo.fetchAndCache()` runs next: the network response is decoded into DTOs, mapped to domain, then written to Isar atomically inside `writeTxn` (the existing rows are cleared and the new snapshot is `putAll`ed in a single transaction). The wire status string is what lands in the Isar row.
+4. On success the fresh list replaces the state, and the last-synced timestamp is written to `SharedPreferences`.
+5. On failure — network, server, or otherwise — if the cache is non-empty the notifier returns the cached list instead of throwing, so the user sees data (and the offline banner if applicable) rather than an error screen. If the cache is also empty, a small demo dataset is seeded once so the end-to-end flow is demonstrable while the backend `GET /api/v1/applications` endpoint is being built.
+
+### Assessment-criteria mapping
+
+| Criterion                                                         | Where                                                                    |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Applications tab in bottom nav                                    | `lib/widgets/scaffold_with_nav_bar.dart` + `lib/router/app_router.dart`  |
+| Loads real data (or seeded stand-in until backend ships)          | `ApplicationsRepository.fetchAndCache` + `_onFetchFailure` seed fallback |
+| Offline banner after force-close + airplane mode                  | `lib/providers/connectivity_provider.dart` + `_OfflineBanner`            |
+| Filter chip persistence                                           | `ApplicationFilterNotifier` reads/writes `SharedPreferences` synchronously |
+| Domain model does not import Isar                                 | `lib/models/job_application.dart` (only imports `job_application_dto.dart` + freezed_annotation) |
+| Isar writes inside `writeTxn`                                     | `ApplicationsRepository._writeSnapshotToCache`                           |
+| `isar_flutter_libs` in dependencies (community fork here)         | `pubspec.yaml` `dependencies:` block                                     |
+| Card + badge are separate files, StatelessWidgets, typed named params | `lib/widgets/application_card.dart`, `lib/widgets/application_status_badge.dart` |
+| Badge uses exhaustive switch expression                           | `ApplicationStatusBadge.build`                                            |
+| Single-column below 600 px, two-column at 600+                    | `_ApplicationsBody._buildBody` LayoutBuilder                             |
+| `build_runner` exits with no errors                               | See `MANUAL STEPS`                                                        |
+| Pre-existing tests continue to pass                               | `flutter test test/widget_test.dart test/job_test.dart` — 33/33 green    |

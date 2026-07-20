@@ -33,6 +33,25 @@ dependencies:
   # json_serializable) are dev-only. See README 2.2, Q2.
   freezed_annotation: ^3.0.0
   json_annotation: ^4.9.0
+  # W2D3 in-class challenge — persistence + connectivity stack for the
+  # Applications feature. `isar_community` is the actively-maintained fork
+  # of Isar (the original `isar` package hasn't been updated for
+  # analyzer 8, which our `custom_lint` from Assignment 2.1 requires);
+  # `isar_flutter_libs_community` ships the platform binaries (MUST be
+  # in dependencies, NOT dev_dependencies — the compiled app links
+  # against them). `shared_preferences` holds the persisted filter
+  # selection + last-synced timestamp. `connectivity_plus` drives the
+  # offline banner via a StreamProvider.
+  isar_community: ^3.3.2
+  isar_community_flutter_libs: ^3.3.2
+  shared_preferences: ^2.3.2
+  connectivity_plus: ^6.1.0
+  # `path_provider` gives us the app-documents directory that Isar
+  # writes its `.isar` file into. Pulled in explicitly because
+  # `isar_community` doesn't re-export it, and calling `Isar.open`
+  # without a directory would default to a location we don't want to
+  # rely on across platforms.
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
@@ -55,6 +74,12 @@ dev_dependencies:
   # compiled app — only the generated Dart source they produce does.
   freezed: ^3.0.0
   json_serializable: ^6.9.0
+  # W2D3 in-class challenge — Isar's schema code generator (community
+  # fork). Emits the `*.g.dart` collection schemas next to each
+  # `@Collection()`-annotated class. Runs under the same build_runner
+  # host as freezed and json_serializable — one
+  # `dart run build_runner build` regenerates all three.
+  isar_community_generator: ^3.3.2
 
 flutter:
   uses-material-design: true

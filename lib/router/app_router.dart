@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../providers/job_providers.dart';
+import '../screens/application_detail_screen.dart';
+import '../screens/applications_screen.dart';
 import '../screens/home_screen.dart';
 import '../screens/job_detail_screen.dart';
 import '../screens/saved_screen.dart';
@@ -26,7 +28,13 @@ class AppRoutes {
 
   static const String jobs = '/jobs';
   static const String saved = '/saved';
+  static const String applications = '/applications';
   static const String login = '/login';
+
+  /// Builds the canonical detail URL for an application composite id.
+  /// The id contains `::` which is unreserved in URI paths, so it
+  /// drops in without encoding.
+  static String applicationDetail(String id) => '$applications/$id';
 
   /// Builds the canonical detail URL for a job id — the ONLY way the app
   /// constructs `/jobs/:id`, so `job.id` (never a list index) is always
@@ -136,6 +144,33 @@ final goRouterProvider = Provider<GoRouter>((ref) {
               GoRoute(
                 path: AppRoutes.saved,
                 builder: (context, state) => const SavedScreen(),
+              ),
+            ],
+          ),
+
+          // Branch 2 (W2D3 in-class challenge, Part 5) — Applications.
+          // Nested detail route matches the same "keep tab state
+          // across switches" pattern the Jobs branch already uses:
+          // pushing /applications/:id lives inside this branch's
+          // navigator so switching tabs and coming back preserves the
+          // stack and the list scroll position.
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: AppRoutes.applications,
+                builder: (context, state) => const ApplicationsScreen(),
+                routes: [
+                  GoRoute(
+                    path: ':id',
+                    builder: (context, state) {
+                      final rawId = state.pathParameters['id'];
+                      return ApplicationDetailScreen(
+                        applicationId:
+                            (rawId == null || rawId.isEmpty) ? null : rawId,
+                      );
+                    },
+                  ),
+                ],
               ),
             ],
           ),

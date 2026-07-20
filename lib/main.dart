@@ -1,25 +1,50 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:isar_community/isar.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import 'data/job_application_isar.dart';
+import 'providers/persistence_providers.dart';
 import 'router/app_router.dart';
 
-void main() {
-  // Assignment 1.3, Part 2: wrap runApp in ProviderScope. This is the
-  // ONLY place ProviderScope is added.
-  runApp(const ProviderScope(child: CareerHubApp()));
+/// W2D3 in-class challenge, Part 2.1 — async bootstrap.
+///
+/// Everything the provider graph needs as a synchronous singleton is
+/// resolved here BEFORE the first `runApp` frame, then handed to
+/// `ProviderScope.overrides`. That way widgets and providers never
+/// have to unwrap a `FutureProvider` for prefs or Isar — the values are
+/// already there.
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final dir = await getApplicationDocumentsDirectory();
+  final isar = await Isar.open(
+    [JobApplicationIsarSchema],
+    directory: dir.path,
+  );
+  final prefs = await SharedPreferences.getInstance();
+
+  runApp(
+    ProviderScope(
+      overrides: [
+        isarProvider.overrideWithValue(isar),
+        sharedPreferencesProvider.overrideWithValue(prefs),
+      ],
+      child: const CareerHubApp(),
+    ),
+  );
 }
 
-/// Assignment 1.4: CareerHubApp becomes a ConsumerWidget so it can read the
-/// GoRouter out of goRouterProvider, and switches from MaterialApp with a
-/// `home:` to MaterialApp.router driven by that router. The URL is now the
-/// source of truth for what is on screen — there is no single home widget
-/// any more.
+/// Assignment 1.4: CareerHubApp is a ConsumerWidget so it can read the
+/// GoRouter out of goRouterProvider, and switches from MaterialApp with
+/// a `home:` to MaterialApp.router driven by that router. The URL is
+/// the source of truth for what is on screen — there is no single home
+/// widget any more.
 class CareerHubApp extends ConsumerWidget {
   const CareerHubApp({super.key});
 
-  // Same deep-teal seed from Assignment 1.1. Part 3a requires reusing it,
-  // not choosing a new one — light and dark themes should read as the
-  // same app, not two different apps.
+  // Same deep-teal seed from Assignment 1.1.
   static const Color _seedColor = Color(0xFF00695C);
 
   @override
@@ -40,9 +65,7 @@ class CareerHubApp extends ConsumerWidget {
           brightness: Brightness.dark,
         ),
       ),
-      // Follows the device's system setting rather than forcing one mode.
       themeMode: ThemeMode.system,
-      // Wires GoRouter's parser, delegate and back-button dispatcher in.
       routerConfig: router,
     );
   }

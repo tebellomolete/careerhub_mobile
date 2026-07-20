@@ -51,6 +51,12 @@ class ScaffoldWithNavBar extends StatelessWidget {
             selectedIcon: Icon(Icons.bookmark),
             label: 'Saved',
           ),
+          // W2D3 in-class challenge, Part 5.1 — the Applications tab.
+          NavigationDestination(
+            icon: Icon(Icons.assignment_outlined),
+            selectedIcon: Icon(Icons.assignment),
+            label: 'Applications',
+          ),
         ],
       ),
     );
