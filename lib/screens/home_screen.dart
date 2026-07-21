@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../models/job.dart';
+import '../providers/connectivity_provider.dart';
+import '../providers/filter_notifier.dart';
 import '../providers/job_providers.dart';
 import '../providers/jobs_notifier.dart';
 import '../router/app_router.dart';
@@ -11,18 +13,17 @@ import '../widgets/empty_jobs_widget.dart';
 
 /// CareerHub's main screen.
 ///
-/// Assignment 2.1 changes from 1.4:
-///   - watches [visibleJobsProvider], which now sits on top of
-///     [jobsProvider] (the generated AsyncNotifier), not the
-///     old hardcoded FutureProvider;
-///   - the retry button and pull-to-refresh both call
-///     `jobsProvider.notifier.refresh()` — one code path,
-///     one loading spinner, one error surface;
-///   - the `_SimulateNotificationButton` and `_FailToggleButton` from
-///     1.4 are removed: with runtime Guid IDs there is no meaningful
-///     "job #3" to jump to, and the error state is now tested by
-///     stopping the API (see README Q4 and Part 5's verification
-///     checklist).
+/// Assignment 2.3 changes from 2.2:
+///   - The Location dropdown now reads and writes `filterProvider`
+///     (persisted to SharedPreferences), NOT the old ephemeral
+///     `locationFilterProvider` `StateProvider<LocationType?>` — the
+///     brief's Part 7 requires the filter selection to survive
+///     force-close. See README 2.3, Part 7.
+///   - A new offline banner (Part 9.1) sits above the search field
+///     when `isOfflineProvider` returns `true`. Uses
+///     `colorScheme.errorContainer` / `onErrorContainer` and shows
+///     the cache-age string from `cacheAgeProvider` (Stretch A)
+///     when available, with a generic fallback otherwise.
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
@@ -51,6 +52,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final visibleJobsAsync = ref.watch(visibleJobsProvider);
+    // Assignment 2.3, Part 9.1 — the offline flag drives the banner
+    // above the search field. Cold-boot behaviour explained in
+    // README 2.3, Q4: `isOfflineProvider` is `false` on the very
+    // first frame (the connectivity stream hasn't emitted yet) even
+    // when the device is actually offline, then flips to `true`
+    // within under a second when the first change event arrives.
+    final isOffline = ref.watch(isOfflineProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -63,6 +71,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
       body: Column(
         children: [
+          // Part 9.1 — the offline banner. Rendered conditionally
+          // (not always-present with an animation) because a hidden
+          // banner should not consume vertical space above the list.
+          if (isOffline) const _OfflineBanner(),
+
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
             child: TextField(
@@ -175,6 +188,55 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 }
 
+/// Assignment 2.3, Part 9.1 — the offline banner.
+///
+/// - background: `colorScheme.errorContainer`
+/// - foreground: `colorScheme.onErrorContainer`
+/// - icon: `Icons.cloud_off_outlined`
+/// - text: `cacheAgeProvider` (Stretch A) when available, otherwise
+///   the generic fallback "You're offline — showing cached jobs."
+///
+/// Appears and disappears automatically without any user interaction —
+/// the parent widget's `if (isOffline)` guard is the only visibility
+/// switch.
+class _OfflineBanner extends ConsumerWidget {
+  const _OfflineBanner();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final scheme = Theme.of(context).colorScheme;
+    // Stretch A — the age string; `null` when the app has never had
+    // a successful network response. See README 2.3, Stretch A.
+    final ageString = ref.watch(cacheAgeProvider);
+    final message = ageString ?? "You're offline — showing cached jobs.";
+
+    return Container(
+      width: double.infinity,
+      color: scheme.errorContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Icon(
+            Icons.cloud_off_outlined,
+            color: scheme.onErrorContainer,
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              message,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: scheme.onErrorContainer,
+                    fontWeight: FontWeight.w500,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Two side-by-side dropdown filters above the job list/grid.
 class _FilterDropdownRow extends StatelessWidget {
   const _FilterDropdownRow();
@@ -231,12 +293,27 @@ class _FilterField extends StatelessWidget {
   }
 }
 
+/// Assignment 2.3, Part 7 (Step 7.3) — the Location dropdown now reads
+/// the persisted `filterProvider` (String) and writes via
+/// `.select(String)` so the selection survives force-close.
+///
+/// The dropdown items are `LocationType?` values (unchanged from 2.2);
+/// two small conversions bridge to the String world:
+///   - read:  `_dropdownValueFromFilter(String)` → `LocationType?`
+///   - write: `_filterFromDropdownValue(LocationType?)` → `String`
+///
+/// The dropdown items themselves are unchanged; the filter predicate
+/// in `filteredJobsProvider` uses the same String conversion.
 class _LocationFilterDropdown extends ConsumerWidget {
   const _LocationFilterDropdown();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final selected = ref.watch(locationFilterProvider);
+    // Part 7 — a subscription: rebuild whenever the persisted filter
+    // changes (e.g. on cold boot after `build()` reads the stored
+    // value). See README 2.3, Part 7.
+    final filter = ref.watch(filterProvider);
+    final selected = _dropdownValueFromFilter(filter);
 
     return DropdownButtonFormField<LocationType?>(
       initialValue: selected,
@@ -268,9 +345,27 @@ class _LocationFilterDropdown extends ConsumerWidget {
           child: Text('Hybrid'),
         ),
       ],
-      onChanged: (value) =>
-          ref.read(locationFilterProvider.notifier).state = value,
+      // Part 7 — a mutation. `ref.read` inside `onChanged` matches the
+      // widget-level `watch`-vs-`read` rule from Assignment 1.3 Q1.
+      // `.notifier` resolves to the `FilterNotifier` instance so we
+      // can call `.select(...)`, which handles both the
+      // SharedPreferences write and the state update.
+      onChanged: (value) => ref
+          .read(filterProvider.notifier)
+          .select(_filterFromDropdownValue(value)),
     );
+  }
+
+  static LocationType? _dropdownValueFromFilter(String filter) {
+    if (filter == kFilterAll) return null;
+    for (final value in LocationType.values) {
+      if (value.name == filter) return value;
+    }
+    return null;
+  }
+
+  static String _filterFromDropdownValue(LocationType? value) {
+    return value?.name ?? kFilterAll;
   }
 }
 

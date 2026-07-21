@@ -8,63 +8,117 @@ part of 'jobs_notifier.dart';
 
 // GENERATED CODE - DO NOT MODIFY BY HAND
 // ignore_for_file: type=lint, type=warning
-/// Assignment 2.1 → 2.2 — the async source of truth for the jobs list.
+/// Assignment 2.1 → 2.3 — the async source of truth for the jobs list.
 ///
-/// Assignment 2.2 change: `build()` still returns `Future<List<Job>>`,
-/// but it now receives an `ApiResult<List<Job>>` from the repository
-/// and pattern-matches on it with an EXHAUSTIVE SWITCH EXPRESSION.
-/// The compiler refuses to compile the switch if any variant of the
-/// sealed hierarchy (`Success`, `NetworkFailure`, `ServerFailure`,
-/// `UnknownFailure`) is unhandled — that is the compile-time guarantee
-/// the sealed keyword gives us. See README 2.2, Q4.
+/// Assignment 2.3 changes:
+///   - `build()` is now CACHE-THEN-NETWORK (Part 8, Step 8.1). The
+///     algorithm:
+///       1. Read the cache via `getCachedJobs()`.
+///       2. If non-empty, `state = AsyncData(cachedJobs)` — this
+///          transitions `jobsProvider` from `AsyncLoading` to
+///          `AsyncData` immediately, so the widget layer replaces the
+///          spinner with the cached list BEFORE the network call
+///          begins. This is exactly the second of the three state
+///          transitions documented in README 2.3, Q4.
+///       3. Call `getJobs()` (the network call).
+///       4. Pattern-match on the `ApiResult`:
+///          - `Success(data)` → return `data` (fresh from network).
+///          - Any `Failure` → return `cachedJobs` if non-empty; else
+///            throw (which surfaces as `AsyncError` on `jobsProvider`
+///            and drives the error retry screen). The Failure-with-
+///            cache branch is what keeps the user's view intact when
+///            a background refresh fails.
+///   - Return type still `Future<List<Job>>` — the widget layer's
+///     `.when()` contract is unchanged.
 ///
-/// The public contract to the widget layer is UNCHANGED: on failure
-/// the switch's `throw Exception(...)` surfaces as an
-/// `AsyncValue.error` on `jobsProvider`, exactly as before. The widget
-/// tree's existing `AsyncValue.when(error: ...)` handler already
-/// renders that state — no widget-layer change is needed. That is
-/// exactly why the widget test in `test/widget_test.dart` still passes
-/// unchanged. See README 2.2, Part 9.
+/// Assignment 2.3 Stretch B additions:
+///   - `ref.listen(cachedJobsStreamProvider, ...)` subscribes to
+///     write events on the Isar `jobCaches` collection. When an
+///     EXTERNAL write happens (a debug tool, a future write path
+///     outside this notifier), the listener invalidates the notifier
+///     so the UI re-derives from the fresh cache.
+///   - A private `_selfWrote` guard prevents the circular-write
+///     problem: this notifier writes to Isar on every successful
+///     `getJobs()` (inside the repository), which fires the stream,
+///     which — without a guard — would invalidate the notifier and
+///     trigger another `getJobs()` on the very next microtask. See
+///     README 2.3, Stretch B.
 
 @ProviderFor(JobsNotifier)
 const jobsProvider = JobsNotifierProvider._();
 
-/// Assignment 2.1 → 2.2 — the async source of truth for the jobs list.
+/// Assignment 2.1 → 2.3 — the async source of truth for the jobs list.
 ///
-/// Assignment 2.2 change: `build()` still returns `Future<List<Job>>`,
-/// but it now receives an `ApiResult<List<Job>>` from the repository
-/// and pattern-matches on it with an EXHAUSTIVE SWITCH EXPRESSION.
-/// The compiler refuses to compile the switch if any variant of the
-/// sealed hierarchy (`Success`, `NetworkFailure`, `ServerFailure`,
-/// `UnknownFailure`) is unhandled — that is the compile-time guarantee
-/// the sealed keyword gives us. See README 2.2, Q4.
+/// Assignment 2.3 changes:
+///   - `build()` is now CACHE-THEN-NETWORK (Part 8, Step 8.1). The
+///     algorithm:
+///       1. Read the cache via `getCachedJobs()`.
+///       2. If non-empty, `state = AsyncData(cachedJobs)` — this
+///          transitions `jobsProvider` from `AsyncLoading` to
+///          `AsyncData` immediately, so the widget layer replaces the
+///          spinner with the cached list BEFORE the network call
+///          begins. This is exactly the second of the three state
+///          transitions documented in README 2.3, Q4.
+///       3. Call `getJobs()` (the network call).
+///       4. Pattern-match on the `ApiResult`:
+///          - `Success(data)` → return `data` (fresh from network).
+///          - Any `Failure` → return `cachedJobs` if non-empty; else
+///            throw (which surfaces as `AsyncError` on `jobsProvider`
+///            and drives the error retry screen). The Failure-with-
+///            cache branch is what keeps the user's view intact when
+///            a background refresh fails.
+///   - Return type still `Future<List<Job>>` — the widget layer's
+///     `.when()` contract is unchanged.
 ///
-/// The public contract to the widget layer is UNCHANGED: on failure
-/// the switch's `throw Exception(...)` surfaces as an
-/// `AsyncValue.error` on `jobsProvider`, exactly as before. The widget
-/// tree's existing `AsyncValue.when(error: ...)` handler already
-/// renders that state — no widget-layer change is needed. That is
-/// exactly why the widget test in `test/widget_test.dart` still passes
-/// unchanged. See README 2.2, Part 9.
+/// Assignment 2.3 Stretch B additions:
+///   - `ref.listen(cachedJobsStreamProvider, ...)` subscribes to
+///     write events on the Isar `jobCaches` collection. When an
+///     EXTERNAL write happens (a debug tool, a future write path
+///     outside this notifier), the listener invalidates the notifier
+///     so the UI re-derives from the fresh cache.
+///   - A private `_selfWrote` guard prevents the circular-write
+///     problem: this notifier writes to Isar on every successful
+///     `getJobs()` (inside the repository), which fires the stream,
+///     which — without a guard — would invalidate the notifier and
+///     trigger another `getJobs()` on the very next microtask. See
+///     README 2.3, Stretch B.
 final class JobsNotifierProvider
     extends $AsyncNotifierProvider<JobsNotifier, List<Job>> {
-  /// Assignment 2.1 → 2.2 — the async source of truth for the jobs list.
+  /// Assignment 2.1 → 2.3 — the async source of truth for the jobs list.
   ///
-  /// Assignment 2.2 change: `build()` still returns `Future<List<Job>>`,
-  /// but it now receives an `ApiResult<List<Job>>` from the repository
-  /// and pattern-matches on it with an EXHAUSTIVE SWITCH EXPRESSION.
-  /// The compiler refuses to compile the switch if any variant of the
-  /// sealed hierarchy (`Success`, `NetworkFailure`, `ServerFailure`,
-  /// `UnknownFailure`) is unhandled — that is the compile-time guarantee
-  /// the sealed keyword gives us. See README 2.2, Q4.
+  /// Assignment 2.3 changes:
+  ///   - `build()` is now CACHE-THEN-NETWORK (Part 8, Step 8.1). The
+  ///     algorithm:
+  ///       1. Read the cache via `getCachedJobs()`.
+  ///       2. If non-empty, `state = AsyncData(cachedJobs)` — this
+  ///          transitions `jobsProvider` from `AsyncLoading` to
+  ///          `AsyncData` immediately, so the widget layer replaces the
+  ///          spinner with the cached list BEFORE the network call
+  ///          begins. This is exactly the second of the three state
+  ///          transitions documented in README 2.3, Q4.
+  ///       3. Call `getJobs()` (the network call).
+  ///       4. Pattern-match on the `ApiResult`:
+  ///          - `Success(data)` → return `data` (fresh from network).
+  ///          - Any `Failure` → return `cachedJobs` if non-empty; else
+  ///            throw (which surfaces as `AsyncError` on `jobsProvider`
+  ///            and drives the error retry screen). The Failure-with-
+  ///            cache branch is what keeps the user's view intact when
+  ///            a background refresh fails.
+  ///   - Return type still `Future<List<Job>>` — the widget layer's
+  ///     `.when()` contract is unchanged.
   ///
-  /// The public contract to the widget layer is UNCHANGED: on failure
-  /// the switch's `throw Exception(...)` surfaces as an
-  /// `AsyncValue.error` on `jobsProvider`, exactly as before. The widget
-  /// tree's existing `AsyncValue.when(error: ...)` handler already
-  /// renders that state — no widget-layer change is needed. That is
-  /// exactly why the widget test in `test/widget_test.dart` still passes
-  /// unchanged. See README 2.2, Part 9.
+  /// Assignment 2.3 Stretch B additions:
+  ///   - `ref.listen(cachedJobsStreamProvider, ...)` subscribes to
+  ///     write events on the Isar `jobCaches` collection. When an
+  ///     EXTERNAL write happens (a debug tool, a future write path
+  ///     outside this notifier), the listener invalidates the notifier
+  ///     so the UI re-derives from the fresh cache.
+  ///   - A private `_selfWrote` guard prevents the circular-write
+  ///     problem: this notifier writes to Isar on every successful
+  ///     `getJobs()` (inside the repository), which fires the stream,
+  ///     which — without a guard — would invalidate the notifier and
+  ///     trigger another `getJobs()` on the very next microtask. See
+  ///     README 2.3, Stretch B.
   const JobsNotifierProvider._()
     : super(
         from: null,
@@ -84,25 +138,43 @@ final class JobsNotifierProvider
   JobsNotifier create() => JobsNotifier();
 }
 
-String _$jobsNotifierHash() => r'cc01992b4d58cce1b26d2173aa853c247cbde774';
+String _$jobsNotifierHash() => r'c6be4533785e5ec89431717437f99b704b93ce47';
 
-/// Assignment 2.1 → 2.2 — the async source of truth for the jobs list.
+/// Assignment 2.1 → 2.3 — the async source of truth for the jobs list.
 ///
-/// Assignment 2.2 change: `build()` still returns `Future<List<Job>>`,
-/// but it now receives an `ApiResult<List<Job>>` from the repository
-/// and pattern-matches on it with an EXHAUSTIVE SWITCH EXPRESSION.
-/// The compiler refuses to compile the switch if any variant of the
-/// sealed hierarchy (`Success`, `NetworkFailure`, `ServerFailure`,
-/// `UnknownFailure`) is unhandled — that is the compile-time guarantee
-/// the sealed keyword gives us. See README 2.2, Q4.
+/// Assignment 2.3 changes:
+///   - `build()` is now CACHE-THEN-NETWORK (Part 8, Step 8.1). The
+///     algorithm:
+///       1. Read the cache via `getCachedJobs()`.
+///       2. If non-empty, `state = AsyncData(cachedJobs)` — this
+///          transitions `jobsProvider` from `AsyncLoading` to
+///          `AsyncData` immediately, so the widget layer replaces the
+///          spinner with the cached list BEFORE the network call
+///          begins. This is exactly the second of the three state
+///          transitions documented in README 2.3, Q4.
+///       3. Call `getJobs()` (the network call).
+///       4. Pattern-match on the `ApiResult`:
+///          - `Success(data)` → return `data` (fresh from network).
+///          - Any `Failure` → return `cachedJobs` if non-empty; else
+///            throw (which surfaces as `AsyncError` on `jobsProvider`
+///            and drives the error retry screen). The Failure-with-
+///            cache branch is what keeps the user's view intact when
+///            a background refresh fails.
+///   - Return type still `Future<List<Job>>` — the widget layer's
+///     `.when()` contract is unchanged.
 ///
-/// The public contract to the widget layer is UNCHANGED: on failure
-/// the switch's `throw Exception(...)` surfaces as an
-/// `AsyncValue.error` on `jobsProvider`, exactly as before. The widget
-/// tree's existing `AsyncValue.when(error: ...)` handler already
-/// renders that state — no widget-layer change is needed. That is
-/// exactly why the widget test in `test/widget_test.dart` still passes
-/// unchanged. See README 2.2, Part 9.
+/// Assignment 2.3 Stretch B additions:
+///   - `ref.listen(cachedJobsStreamProvider, ...)` subscribes to
+///     write events on the Isar `jobCaches` collection. When an
+///     EXTERNAL write happens (a debug tool, a future write path
+///     outside this notifier), the listener invalidates the notifier
+///     so the UI re-derives from the fresh cache.
+///   - A private `_selfWrote` guard prevents the circular-write
+///     problem: this notifier writes to Isar on every successful
+///     `getJobs()` (inside the repository), which fires the stream,
+///     which — without a guard — would invalidate the notifier and
+///     trigger another `getJobs()` on the very next microtask. See
+///     README 2.3, Stretch B.
 
 abstract class _$JobsNotifier extends $AsyncNotifier<List<Job>> {
   FutureOr<List<Job>> build();

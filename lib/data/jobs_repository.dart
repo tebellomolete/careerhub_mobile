@@ -1,8 +1,13 @@
 import 'package:dio/dio.dart';
+import 'package:isar_community/isar.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/isar_provider.dart';
+import '../core/prefs_provider.dart';
 import '../models/job.dart';
 import 'api_result.dart';
+import 'job_cache.dart';
 import 'job_dto.dart';
 
 // Assignment 2.1 — the part directive for the file the generator emits.
@@ -83,44 +88,105 @@ Dio dio(Ref ref) {
   return client;
 }
 
-/// Assignment 2.1 — the repository provider. Wires the singleton Dio
-/// into [JobsRepository].
+/// Assignment 2.1 → 2.3 — the repository provider. Wires the singleton
+/// Dio, the singleton Isar instance, and the singleton SharedPreferences
+/// instance into [JobsRepository].
+///
+/// Assignment 2.3 change: this provider now also watches
+/// [isarProvider] and [prefsProvider] — both of which are overridden
+/// in `main.dart` with real, opened instances before `runApp`. See
+/// README 2.3, Part 5.
 @Riverpod(keepAlive: true)
 JobsRepository jobsRepository(Ref ref) {
-  return JobsRepository(ref.watch(dioProvider));
+  return JobsRepository(
+    dio: ref.watch(dioProvider),
+    isar: ref.watch(isarProvider),
+    prefs: ref.watch(prefsProvider),
+  );
 }
 
-/// Assignment 2.1 → 2.2 — the repository. The rest of the app never
-/// sees [Dio], never sees [JobDto], and never sees a URL. It calls
-/// [getJobs] and receives an `ApiResult<List<Job>>` — either a
-/// [Success] wrapping the jobs list, or one of the three sealed failure
-/// variants ([NetworkFailure], [ServerFailure], [UnknownFailure]).
+/// Assignment 2.1 → 2.3 — the repository.
 ///
-/// Assignment 2.2 changes:
-///   - Return type is now `Future<ApiResult<List<Job>>>` (was
-///     `Future<List<Job>>`). Errors travel as VALUES the notifier can
-///     pattern-match on, not as exceptions the widget layer has to
-///     unwrap. See README 2.2, Q4.
+/// The rest of the app never sees [Dio], never sees [JobDto], never
+/// sees [Isar], never sees [SharedPreferences], and never sees a URL.
+/// It calls [getJobs] / [getCachedJobs] and receives typed values —
+/// either an `ApiResult<List<Job>>` (network path) or a `List<Job>`
+/// (cache path).
+///
+/// Assignment 2.2 changes (retained):
+///   - Return type of [getJobs] is `Future<ApiResult<List<Job>>>`.
 ///   - The parsing step is factored into [_parseJobsPage] which returns
-///     a NAMED RECORD — `({List<JobDto> dtos, List<Job> jobs})` — and
-///     the call site destructures both lists into clearly named
-///     locals. Part 3 Step 3.3.
-///   - The `DioException` → message translation is a SWITCH EXPRESSION
-///     over `e.type`, producing exactly one string per branch. Part 8.
+///     a named record.
+///   - The `DioException` → message translation is a switch expression.
+///
+/// Assignment 2.3 changes:
+///   - Constructor now takes required named [isar] and [prefs] fields.
+///   - New [getCachedJobs] reads every row from the Isar `jobCaches`
+///     collection and returns `Future<List<Job>>` — no network call.
+///   - [getJobs], on `Success`, writes the fresh list to Isar inside a
+///     single `writeTxn` — `clear()` before `putAll()` — and updates
+///     the `jobs_last_synced` SharedPreferences key (Stretch A).
+///   - Two private conversion methods live here (one per direction),
+///     so `Job` (domain) and `JobCache` (storage) never import each
+///     other. See README 2.3, Part 5.
+///   - A private [_locationTypeFromName] helper reverse-maps the
+///     stored enum name to a [LocationType]; on unknown input it
+///     returns `LocationType.onSite` rather than throwing. See
+///     README 2.3, Q2.
 class JobsRepository {
   final Dio _dio;
+  final Isar _isar;
+  final SharedPreferences _prefs;
 
-  JobsRepository(this._dio);
+  JobsRepository({
+    required Dio dio,
+    required Isar isar,
+    required SharedPreferences prefs,
+  })  : _dio = dio,
+        _isar = isar,
+        _prefs = prefs;
+
+  /// Assignment 2.3, Stretch A — the SharedPreferences key the cache-
+  /// age indicator reads from. Written here alongside every successful
+  /// Isar write; read by `cacheAgeProvider` (see
+  /// `lib/providers/connectivity_provider.dart`).
+  static const String _lastSyncedKey = 'jobs_last_synced';
+
+  /// Assignment 2.3 — expose the Isar handle so a downstream
+  /// `StreamProvider` (Stretch B) can subscribe to `jobCaches.watchLazy`
+  /// without needing to inject `isarProvider` a second time. The
+  /// getter is deliberately narrow: callers can subscribe, but every
+  /// WRITE still goes through [getJobs] which owns the `writeTxn` +
+  /// clear+putAll sequence and the sibling `_lastSyncedKey` update.
+  Isar get isar => _isar;
+
+  /// Assignment 2.3, Part 5 — read every cached job from Isar as a
+  /// `List<Job>`. Never touches the network. Returns an empty list
+  /// when the collection is empty (a fresh install, or after
+  /// `writeTxn(() => isar.clear())` from a debug menu). No error
+  /// path — Isar's `.findAll()` on an open instance can't fail in a
+  /// way the caller is expected to recover from; a corrupt DB file
+  /// throws an unrecoverable `IsarError` that bubbles up as an
+  /// `AsyncError` on the notifier, exactly like a network error would.
+  Future<List<Job>> getCachedJobs() async {
+    final rows = await _isar.jobCaches.where().findAll();
+    return rows.map(_toJob).toList(growable: false);
+  }
 
   /// `GET /jobs?page=1&pageSize=100` — the CareerHub list endpoint.
   ///
-  /// Behaviour is unchanged from Assignment 2.1 on the happy path:
-  /// unwrap the `PagedResponse<JobResponse>` envelope, decode each row
-  /// into a [JobDto], map each DTO onto a [Job]. What is different is
-  /// the failure path: exceptions never leave this method. Every
-  /// failure is caught and returned as a [NetworkFailure],
-  /// [ServerFailure], or [UnknownFailure] — the notifier's switch
-  /// expression handles them exhaustively (see [JobsNotifier.build]).
+  /// Assignment 2.3 change: on `Success` the fresh `List<Job>` is
+  /// written to Isar inside a single `writeTxn` — `clear()` before
+  /// `putAll()` — so a job the server removed between requests does
+  /// not linger in the cache. The write is fire-and-forget from the
+  /// caller's perspective: the returned `Success(jobs)` is unchanged
+  /// in shape from 2.2, so the notifier's pattern-match is
+  /// unaffected.
+  ///
+  /// The sibling `_prefs.setInt(_lastSyncedKey, ...)` write is
+  /// Stretch A — the cache-age indicator in the offline banner. It
+  /// runs AFTER the Isar write so a mid-flight failure cannot leave
+  /// the timestamp advanced against an empty (or older) collection.
   Future<ApiResult<List<Job>>> getJobs() async {
     try {
       final response = await _dio.get<Map<String, dynamic>>(
@@ -155,6 +221,33 @@ class JobsRepository {
       // domain), and a future extension (‘log DTO count for
       // telemetry’) is a one-line addition, not a signature change.
       final _ = dtos;
+
+      // Assignment 2.3, Part 5 — write the fresh list to Isar. The
+      // ordering inside the transaction is critical:
+      //   1. `clear()` — remove every previous cache row so a job the
+      //      server dropped between requests does not linger.
+      //   2. `putAll()` — insert every fresh row. Isar assigns each
+      //      row a new autoincrement `id` (the domain `jobId` String
+      //      is stored as an ordinary field, see `job_cache.dart`).
+      // Both operations happen inside a single `writeTxn` so a mid-
+      // transaction crash leaves the collection either fully old or
+      // fully new — never half-populated with a mix.
+      final caches = jobs.map(_toCache).toList(growable: false);
+      await _isar.writeTxn(() async {
+        await _isar.jobCaches.clear();
+        await _isar.jobCaches.putAll(caches);
+      });
+
+      // Assignment 2.3, Stretch A — after the Isar write succeeds,
+      // update the last-synced timestamp so the offline banner can
+      // render "Last updated N minutes ago" instead of a generic
+      // string on the next offline launch. The `Future<bool>`
+      // returned by `setInt` is intentionally not awaited — the
+      // write is best-effort; failing to advance the timestamp only
+      // costs the user an accurate "N minutes ago" string, not the
+      // cache itself. See README 2.3, Stretch A.
+      // ignore: unawaited_futures
+      _prefs.setInt(_lastSyncedKey, DateTime.now().millisecondsSinceEpoch);
 
       return Success(jobs);
     } on DioException catch (e) {
@@ -200,6 +293,70 @@ class JobsRepository {
         .toList(growable: false);
     final jobs = dtos.map(Job.fromDto).toList(growable: false);
     return (dtos: dtos, jobs: jobs);
+  }
+
+  /// Assignment 2.3, Part 5 — the ONE domain-to-storage conversion.
+  /// Private on purpose: nothing outside this file constructs a
+  /// [JobCache], and no widget/screen/provider ever imports the class.
+  JobCache _toCache(Job job) {
+    return JobCache()
+      ..jobId = job.id
+      ..title = job.title
+      ..company = job.company
+      ..location = job.location
+      // See README 2.3, Q2 — enum stored as its `.name`.
+      ..locationTypeName = job.locationType.name
+      ..salary = job.salary
+      ..employmentType = job.employmentType
+      // See README 2.3, Q2 — `DateTime?` stored natively.
+      ..closingDate = job.closingDate
+      ..description = job.description
+      ..isOpen = job.isOpen
+      ..userNote = job.userNote;
+  }
+
+  /// Assignment 2.3, Part 5 — the ONE storage-to-domain conversion.
+  /// The mirror of [_toCache].
+  Job _toJob(JobCache cache) {
+    return Job(
+      id: cache.jobId,
+      title: cache.title,
+      company: cache.company,
+      location: cache.location,
+      locationType: _locationTypeFromName(cache.locationTypeName),
+      salary: cache.salary,
+      employmentType: cache.employmentType,
+      closingDate: cache.closingDate,
+      description: cache.description,
+      isOpen: cache.isOpen,
+      userNote: cache.userNote,
+    );
+  }
+
+  /// Assignment 2.3, Q2 — reverse-map the stored `.name` String back to
+  /// a [LocationType] value, with a NAMED FALLBACK.
+  ///
+  /// The lookup uses `LocationType.values.byName` which throws
+  /// `ArgumentError` on any string it does not recognise — for example
+  /// if the cache was written by a build that had a `LocationType.contract`
+  /// member that has since been renamed to `LocationType.contractor`.
+  /// A throw here would take down `getCachedJobs()` — the code path
+  /// the entire offline demo relies on — so the try/catch converts
+  /// the miss into `LocationType.onSite`, which:
+  ///   1. Keeps the rest of the cached list rendering (the whole
+  ///      point of the offline story).
+  ///   2. Is the safest visible fallback — "onSite" is the
+  ///      most-common state and won't accidentally hide the job from
+  ///      an active `Remote`/`Hybrid` filter (worst case: the job
+  ///      appears when it "shouldn't" for that filter, which is
+  ///      strictly better than "the app crashed on cold boot").
+  /// See README 2.3, Q2.
+  LocationType _locationTypeFromName(String name) {
+    try {
+      return LocationType.values.byName(name);
+    } on ArgumentError {
+      return LocationType.onSite;
+    }
   }
 
   /// Part 8 — the DioException → human-readable-message translator.

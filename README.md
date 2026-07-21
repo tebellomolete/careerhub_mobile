@@ -1,3 +1,892 @@
+# CareerHub — Assignment 2.3: Local Persistence and Offline-First
+
+_Written 2026-07-21._
+
+Week 2, Assignment 2.3. This section contains the four written decisions
+(Part 1), the Isar schema and cache-then-network wiring, the offline
+banner, the persisted filter, the three demo write-ups (cold-boot
+cache, offline banner, filter persistence), the three stretch goals
+(A: cache age in banner, B: Isar `watchLazy` stream, C: offline action
+gating), the test-modification note, and the screenshot placeholders.
+The Assignment 2.2 and earlier notes are preserved further down as
+historical context.
+
+---
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — The two persistence mechanisms and why they are not interchangeable
+
+**Why the jobs list cannot be stored in SharedPreferences.** The
+supported value types are `String`, `bool`, `int`, `double`, and
+`List<String>` — every write goes through the Android
+`SharedPreferences` XML file or, on iOS, the `NSUserDefaults` plist,
+and every read pulls a raw scalar back off that same store.
+`List<Job>` is none of those, so persisting it requires wrapping the
+list in an ad-hoc encoding on every cache write:
+`prefs.setString('jobs', jsonEncode(jobs.map((j) => j.toJson()).toList()))` —
+which is (a) an extra `toJson`/`toMap` we don't currently write on
+`Job` because 2.2 deliberately kept `Job` off the JSON boundary
+(`JobDto` owns that), and (b) a synchronous
+`jsonEncode` over a list that CareerHub already loads at `pageSize:
+100`, run every time the notifier's `getJobs()` succeeds. The
+symmetric decode step is worse: on cache read the whole list has to
+go through `jsonDecode` → `List.cast<Map<String, dynamic>>` →
+`Job.fromDto(JobDto.fromJson(...))` on the main isolate before a
+single card can render. **The specific problem** arises the moment the
+user navigates to the Jobs tab while a large `jsonDecode` on the
+previous cache read is still in flight synchronously: `jsonDecode`
+holds the main isolate, the `NavigationBar` tap animation and the tab
+transition stutter (the frame budget is 16.7 ms at 60 Hz — a
+~200-listing decode on a mid-range Android device runs 40–120 ms), and
+the app looks janky at precisely the moment it should feel instant.
+Isar sidesteps this by decoding to binary on a **background isolate**
+that its native library owns — `getCachedJobs()` awaits a `Future` the
+main isolate never blocks on.
+
+**Why the jobs list cannot live in Isar as an arbitrary `List<Job>`
+without a dedicated schema class.** Isar is a schema-first,
+type-safe, native-code embedded database — not a serialisation
+library. When you write `@collection class JobCache { ... }` and run
+the generator, `isar_generator` emits `job_cache.g.dart` containing: a
+compile-time **schema descriptor** (`JobCacheSchema`) that Isar's
+native binary reads at open time to lay out storage, a set of
+per-field **binary encoders/decoders** whose byte layout matches the
+descriptor exactly so a `get()` can reconstruct the object without
+reflection, a type-safe **query API** (`isar.jobCaches.where()…`) that
+lets you write indexed queries against declared fields, and an
+autoincrement primary-key management for `Isar.autoIncrement`. A plain
+Dart `List<Job>` gives Isar *none* of that: Isar has no way to know
+what fields `Job` has, no way to know their byte widths, no way to
+build indices, and no way to produce a strongly-typed query surface. A
+plain `List<Job>` isn't a persistable shape — it's a Dart-runtime
+object graph whose only serialisable representation is the JSON we
+already ruled out above.
+
+**Why a third class is required rather than adding `@collection` to
+`Job` or `JobDto`.** `@freezed` requires every field to be `final`,
+declared inside a single `const factory` constructor's parameter list,
+so that the generated implementation class (`_Job`, `_JobDto`) can be
+`const` and Freezed's `==`/`hashCode`/`copyWith`/mixin have an
+immutable target to bind to. `@collection` requires every persisted
+field to be a **mutable `late` field** (not a constructor parameter),
+because Isar's generated bindings hydrate an instance by
+zero-argument-constructing it and then writing each field one at a
+time through the setter — a `final` field has no setter and a
+`const factory` constructor accepts no zero-argument shape. The two
+annotations therefore demand mutually exclusive class shapes: no
+single class can be both `const`-immutable-with-final-fields and
+mutable-with-late-fields, so a third representation
+(`JobCache`) that is `@collection`-only is the only way to satisfy
+both storage and the domain layer's immutability guarantees at once.
+
+### Question 2 — Isar's type limitations and your conversion strategy
+
+**Enum storage strategy.** `Job` carries `LocationType`
+(`onSite | remote | hybrid`) — not on Isar's native type list. The
+strategy is: at write time, `_toCache(Job job)` stores
+`job.locationType.name` into a `late String locationTypeName` field on
+`JobCache`. At read time, `_toJob(JobCache cache)` calls a private
+`_locationTypeFromName(String)` helper that reverse-looks the string
+up via `LocationType.values.byName(cache.locationTypeName)` **wrapped
+in a `try/catch`** and returns `LocationType.onSite` on any lookup
+miss — a **named fallback**, not a throw. **Why the fallback is
+required.** `values.byName` raises `ArgumentError: "No enum value with
+that name"` on any string it does not recognise, which is exactly the
+shape of a schema-migration hazard: a build that shipped six months
+ago wrote `"contract"` (say) into the cache; a later build renamed the
+enum member to `"contractor"`; on the next cold boot the cached row
+is still `"contract"` and the reverse lookup would blow up **inside
+`getCachedJobs()`**, which is precisely the code path the offline
+demo relies on to render *anything*. The whole point of the cache is
+graceful degradation, so an unknown enum value must map to a safe
+default that lets the rest of the list render, not to a runtime
+exception that turns "app works offline" into "app crashes offline
+because of a rename you did yesterday."
+
+**DateTime vs epoch-int, and the time-zone edge case.** Isar 3.x
+supports `DateTime` natively — it stores the instant along with its
+UTC offset marker and reconstructs an equal `DateTime` on read,
+independent of the device's current local time zone. Storing
+`dateTime.millisecondsSinceEpoch` as an `int` throws that marker
+away. **The exact scenario where the epoch approach is silently
+wrong:** a user in `Africa/Johannesburg` (UTC+2) caches a job whose
+`closingDate` is `2026-07-21 01:00 SAST` — locally the 21st of July.
+They board a flight; the OS auto-switches the device to `UTC` on
+landing. On cold boot in the new zone, the app calls
+`DateTime.fromMillisecondsSinceEpoch(int)`, which reconstructs the
+instant **in the current local zone** — the same epoch value now
+reads as `2026-07-20 23:00 UTC`. The card silently displays "Closes:
+20 Jul" instead of "Closes: 21 Jul" even though the stored integer is
+byte-for-byte identical and no bug has been introduced. Isar's native
+`DateTime` sidesteps this because the round-trip carries the original
+zone offset, so `Job.closingDate` after
+`putAll` / `get` compares equal to what was written and the card
+renders the same day regardless of where the plane landed.
+
+### Question 3 — Initialization order and the provider override pattern
+
+**What `WidgetsFlutterBinding.ensureInitialized()` does and why it
+must be first.** It constructs (or returns the existing) `WidgetsBinding`
+singleton — the concrete subtype of `BindingBase` that pulls in
+`GestureBinding`, `SchedulerBinding`, `ServicesBinding`,
+`PaintingBinding`, `SemanticsBinding`, `RendererBinding`, and
+`WidgetsBinding` itself. The mechanism this object owns and manages is
+the `BinaryMessenger` — the byte-level pipe over which every Flutter
+`MethodChannel` (`plugins.flutter.io/path_provider`,
+`plugins.flutter.io/shared_preferences`, connectivity_plus, Isar's
+native init) sends and receives platform-channel messages between the
+Dart VM and the platform (Android JVM, iOS runtime). `path_provider`'s
+`getApplicationDocumentsDirectory()` is a straight `MethodChannel`
+call; if you invoke it before the binding exists there is no messenger
+to route the call through. **The exact class + message thrown** is:
+
+```
+FlutterError: Binding has not yet been initialized.
+The "instance" getter on the ServicesBinding binding mixin is only
+available once that binding has been initialized.
+Typically, this is done by calling
+"WidgetsFlutterBinding.ensureInitialized()" first.
+```
+
+Which is why the very first line of the new async `main()` is
+`WidgetsFlutterBinding.ensureInitialized();` — every subsequent
+`await` in the boot sequence depends on it.
+
+**Why `throw UnimplementedError` beats returning `null` or a default.**
+The stub `Provider<Isar>` throws on read because the alternative — a
+provider that returned `null` (typed as `Isar?`) or a "sensible
+default" (e.g. a lazily-opened `Isar` inside the provider factory) —
+would allow the app to boot in an *observably-fine* state and then
+crash at a very confusing site far from the real cause. If the override
+were forgotten, a `null` return would produce a
+`_TypeError: type 'Null' is not a subtype of 'Isar'` on the first
+`.jobCaches` dereference inside the repository, with a stack trace
+that names `JobsRepository`, not `main.dart`. Throwing on the read
+itself produces `UnimplementedError: isarProvider was read without an
+override — override it in main.dart via ProviderScope.overrides
+before runApp.`, at the exact site where the fix belongs. Errors
+should name the file that needs to change.
+
+**When `overrideWithValue` takes effect.** The overrides are applied
+the moment the `ProviderScope`'s `ProviderContainer` is *constructed*
+— which is inside `ProviderScope`'s `initState`, *before*
+`runApp` mounts any descendant widget. By the time any `build()`
+method runs and issues `ref.watch(isarProvider)`, the override has
+already replaced the stub factory with a `$SyncValueProvider<Isar>`
+that returns the real, opened `Isar`. Synchronous `ref.watch` inside
+`build()` therefore sees the override — the override is visible at
+that moment. This is exactly what makes it safe for
+`FilterNotifier.build()` to call
+`final prefs = ref.watch(prefsProvider);` and then immediately
+`prefs.getString('selected_filter')` on the returned value — the
+override guarantees `prefs` is a real, already-`getInstance()`-ed
+`SharedPreferences`, not a `Future` or a stub.
+
+**Two disadvantages of `FutureProvider<Isar>` + `Isar.open()` on
+first read.** (1) **Runtime cascade — only visible at runtime.**
+Every `ref.watch(isarProvider)` becomes `AsyncValue<Isar>`, which
+means every consumer that used to synchronously read the Isar
+instance (the repository provider, the connectivity provider composing
+above it, the `FilterNotifier` that watches `prefsProvider`
+synchronously) must be rewritten around `.when()` / `AsyncNotifier` or
+must await a `.future` — a change that the type checker cannot catch
+at compile time in files that haven't been touched yet, so the failure
+mode is "the jobs screen flashes an extra `AsyncLoading` spinner on
+cold boot" or "the offline banner never shows because the isOffline
+provider's synchronous `ref.watch` is now returning
+`AsyncLoading<bool>` instead of a `bool`" — invisible until the app is
+actually run against a specific frame budget. (2) **Startup race and
+double-open risk.** `Isar.open(directory: path)` acquires a
+filesystem-level lock on the underlying `.isar` file; if the first
+`ref.watch(isarProvider)` on the jobs screen happens concurrently
+with a pull-to-refresh that also invalidates the notifier, Riverpod's
+memoisation of the `FutureProvider` normally prevents a double-open
+— but only for that specific `ProviderContainer`. In a test that
+overrides the notifier but not the FutureProvider (or in a hot-restart
+window where the container is torn down and rebuilt around a
+still-open `.isar` file), the second `Isar.open()` throws
+`IsarError('Isar instance has already been opened.')`. Eager
+initialisation in `main()` opens Isar exactly once, before any
+container exists, and the resulting handle is injected as a value —
+there's no code path that can call `Isar.open()` twice.
+
+### Question 4 — The cache-then-network contract with Riverpod's state machine
+
+**The three state transitions during `build()`.** Riverpod's
+`AsyncNotifier` starts in `AsyncLoading` the moment `build()` is
+invoked and settles to whatever `build()` returns.
+
+| # | Before | Trigger line in `build()` | After | Widget rebuild |
+|---|---|---|---|---|
+| 1 | (initial) | `build()` is called; `Future<List<Job>>` is pending | `AsyncLoading` | Screen's `.when(loading:)` → **`CircularProgressIndicator` visible**; `ListView` not built. |
+| 2 | `AsyncLoading` | `state = AsyncData(cachedJobs);` after `getCachedJobs()` returns a non-empty list (cache hit) | `AsyncData(cachedJobs)` | `.when(data:)` fires → **`ListView` replaces the spinner**, populated from the cache, *before the network has been touched*. If the cache is empty this transition is skipped and the spinner stays until the network resolves. |
+| 3 | `AsyncData(cachedJobs)` (or still `AsyncLoading` on a cold cache) | Final `return switch (result) { … };` after `getJobs()` completes | `AsyncData(freshJobs)` on `Success`, **or** unchanged `AsyncData(cachedJobs)` on `Failure` with a non-empty cache, **or** `AsyncError(Exception, stack)` on `Failure` with an empty cache | `ListView` re-renders with fresh rows on Success (visually near-imperceptible if the two lists compare equal via Freezed value-equality — see 2.2 Q1). On cached-Failure there is *no visible change* — the banner does the talking. On cold-cache Failure the `.when(error:)` branch renders the existing `_ErrorState` retry screen. |
+
+**What happens to `filteredJobsProvider` if the notifier throws
+instead of returning cached data on Failure.** `filteredJobsProvider`
+is a plain `Provider<AsyncValue<List<Job>>>` that watches
+`jobsProvider` via `.whenData(...)`. `.whenData` passes through the
+loading and error branches unchanged — it only maps the `data` branch.
+So `AsyncError(exception, stack)` on `jobsProvider` propagates
+straight through and `filteredJobsProvider` also exposes
+`AsyncError(exception, stack)`. The screen's `.when()` call then
+renders the `error:` branch — the red retry state — throwing away
+*the cached list the user was already looking at*. The whole point of
+the cache is defeated. **When throwing would be the more correct
+choice:** a domain in which stale data is worse than no data. Live
+prices in a trading app, live stock levels in a checkout, session
+tokens whose expiry the client cannot verify — cases where showing an
+outdated value is a business/security risk higher than the ergonomic
+cost of a red retry screen. For a jobs list that changes on the
+order of hours, cached data is strictly better than a retry screen.
+
+**Offline-on-cold-boot behaviour.** `connectivity_plus`'s
+`onConnectivityChanged` stream does not emit on subscription — it
+fires the first event only when the device's connectivity *changes*
+(the OS event, not the query). So on the first frame after cold boot,
+`connectivityStreamProvider` is still `AsyncLoading` (no event has
+arrived yet), `isOfflineProvider`'s `.when()` maps
+`loading: () => false` and `error: (_, __) => false`, and the banner
+is therefore **hidden** for the first render frame — even if the
+device is actually in airplane mode. What the user sees: cached jobs
+render instantly (from the Isar hit), no banner appears for that
+first frame, then a moment later (usually well under one second) the
+first connectivity event arrives, the stream fires, `isOfflineProvider`
+recomputes to `true`, and the banner fades in above the list. **Why
+this is acceptable rather than a bug worth fixing.** (a) The cache
+still renders instantly — the fundamental promise ("the app works
+offline") is kept regardless of the banner's timing. (b) The banner
+self-corrects within one connectivity event, which on Android/iOS is
+essentially always sub-second. (c) The alternative fix — awaiting a
+one-shot `Connectivity().checkConnectivity()` inside `main()` and
+seeding the provider — adds another platform-channel round-trip to
+the startup sequence solely to eliminate a single-frame cosmetic
+delay in a status indicator, and complicates the `main()` boot order
+the assignment carefully specifies. The one-frame flash is a fair
+trade for a simpler startup path.
+
+---
+
+## PART 2 — Package setup and permissions
+
+`pubspec.yaml` — five runtime dependencies added, one dev dependency
+added, and two dev-only lints removed to satisfy version resolution.
+
+**Community-fork note.** The brief specifies `isar`,
+`isar_flutter_libs`, and `isar_generator` (the original packages).
+The original Isar 3.1 generator pins two transitive dependencies
+that no longer resolve in this project's ecosystem:
+
+- `analyzer >=4.6.0 <6.0.0` conflicts with `custom_lint 0.8.1`'s
+  `analyzer ^8.0.0`.
+- `source_gen ^1.2.2` conflicts with `riverpod_generator ^3.0.0`'s
+  `source_gen >=3.0.0 <5.0.0`.
+
+I switched to the community fork — **`isar_community`,
+`isar_community_flutter_libs`, `isar_community_generator`** — which
+is a drop-in maintained continuation with the same `@collection`,
+`Isar.open`, `writeTxn`, `putAll`, `watchLazy` API. The only
+difference at the source level is the import path
+(`package:isar_community/isar.dart` instead of
+`package:isar/isar.dart`); every schema decision in Part 3 and every
+transaction call in Part 5 uses the identical spelling. I also
+removed `custom_lint` and `riverpod_lint` from `dev_dependencies` —
+they were pure lint tools (they surface extra style warnings but do
+not participate in compilation, testing, or the `build_runner`
+pipeline), so lifting them out is the least-invasive way to satisfy
+Isar's transitive analyzer pin without downgrading Riverpod.
+
+Final `pubspec.yaml` additions:
+
+- `dependencies:` — `isar_community: ^3.3.0`,
+  `isar_community_flutter_libs: ^3.3.0`, `path_provider: ^2.1.4`,
+  `shared_preferences: ^2.3.2`, `connectivity_plus: ^6.1.0`.
+- `dev_dependencies:` — `isar_community_generator: ^3.3.0`; removed
+  `custom_lint` and `riverpod_lint`.
+
+`isar_community_flutter_libs` is under `dependencies:` (not
+`dev_dependencies`) because it ships the native `libisar.so` /
+`libisar.dylib` binary into the APK/IPA at compile time — placing it
+under `dev_dependencies` compiles and installs cleanly but crashes
+at runtime the first time Isar tries to `dlopen` its native library,
+with no compile-time warning.
+
+`android/app/src/main/AndroidManifest.xml` — one new line added
+immediately before the `<application>` tag:
+
+```xml
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+```
+
+connectivity_plus resolves the device's active network transports
+through Android's `ConnectivityManager` / `NetworkCapabilities` APIs,
+which are gated by that permission — without it, `Connectivity()`
+initialises but never emits a change event, which means the offline
+banner never appears on Android even when airplane mode toggles.
+Debug and profile manifests are untouched (they inherit from the main
+manifest at build time).
+
+---
+
+## PART 3 — Isar schema
+
+`lib/data/job_cache.dart` — a third, storage-only representation of a
+job. Not `@freezed`; not a `JobDto`; deliberately a fourth class
+distinct from `Job`, `JobDto`, and the API's `JobResponse`.
+
+- `@collection` annotation on the class.
+- `Id id = Isar.autoIncrement` — Isar chooses the row's primary key
+  on `put`; the domain `Job.id` (a `Guid` string) is stored as an
+  ordinary field, `jobId`, on the schema so it round-trips through the
+  cache without being mistaken for Isar's numeric primary key.
+- Every field is `late` — no `final`, no `const`, no `required`. Isar
+  hydrates a `JobCache` by zero-arg constructing it and writing each
+  field via its setter, which is incompatible with `final` (see Q1).
+- `locationTypeName` is a `late String` — the enum's `.name`.
+- `part 'job_cache.g.dart'` at the top — the file the generator will
+  emit in Part 9. Until `build_runner` runs the editor shows a red
+  squiggle on the `part` directive; every other declaration compiles.
+
+---
+
+## PART 4 — Core provider stubs and async startup
+
+`lib/core/isar_provider.dart` — a plain `Provider<Isar>` (not
+`@riverpod`) whose factory throws `UnimplementedError` with a message
+that names the fix site. Deliberately not code-generated: the point
+is to make an unset dependency loud and immediately actionable.
+`lib/core/prefs_provider.dart` follows the same pattern for
+`SharedPreferences`.
+
+`lib/main.dart` — `main()` is now `Future<void>` and executes, in
+order:
+
+1. `WidgetsFlutterBinding.ensureInitialized()` — must be first; see
+   Q3.
+2. `final dir = await getApplicationDocumentsDirectory();` — the
+   documents directory `Isar` will write its `.isar` file into.
+3. `final isar = await Isar.open([JobCacheSchema], directory: dir.path);`
+   — the schema list references the generator's output (Part 9), so
+   the IDE will underline `JobCacheSchema` until `build_runner` runs.
+4. `final prefs = await SharedPreferences.getInstance();`
+5. `runApp(ProviderScope(overrides: [isarProvider.overrideWithValue(isar),
+   prefsProvider.overrideWithValue(prefs)], child: const CareerHubApp()));`
+
+`CareerHubApp` is unchanged.
+
+---
+
+## PART 5 — Repository cache layer
+
+`lib/data/jobs_repository.dart` — `JobsRepository` gains a
+`final Isar isar` field, added as a required named parameter on the
+constructor. The `@riverpod` `jobsRepository(ref)` function now
+watches `isarProvider` and passes `isar: ref.watch(isarProvider)`
+into the constructor alongside the existing `dio`.
+
+Two new private methods live on the repository, one direction each,
+so that neither `Job` (the domain model) nor `JobCache` (the
+storage class) knows the other exists:
+
+- `JobCache _toCache(Job job)` — writes every field of `Job`, storing
+  the enum via `.name` (see Q2).
+- `Job _toJob(JobCache cache)` — reads every field back, reverse-
+  looking the enum via the fallback-guarded helper described in Q2.
+
+`Future<List<Job>> getCachedJobs()` — reads every row from
+`isar.jobCaches.where().findAll()` and maps it through `_toJob`. No
+network call.
+
+`getJobs()` is unchanged in signature and return type but now, on
+`Success`, wraps a write to Isar in the exact transaction shape the
+brief specifies:
+
+```dart
+await isar.writeTxn(() async {
+  await isar.jobCaches.clear();
+  await isar.jobCaches.putAll(jobs.map(_toCache).toList());
+});
+```
+
+`clear()` before `putAll()` guarantees that a job the server removed
+between requests does not linger in the cache. Also (Stretch A):
+`prefs.setInt('jobs_last_synced', DateTime.now().millisecondsSinceEpoch)`
+runs alongside the write.
+
+---
+
+## PART 6 — Connectivity detection
+
+`lib/providers/connectivity_provider.dart` — a plain file, no
+`@riverpod`, no `part` directive.
+
+- One module-level `Connectivity()` instance, so
+  `connectivity_plus`'s single platform-channel subscription is
+  created exactly once per process.
+- `connectivityStreamProvider`, typed **`StreamProvider<List<ConnectivityResult>>`**
+  (not the singular `ConnectivityResult`) — connectivity_plus 5.0
+  changed its API to emit a list because a device can be reachable
+  through multiple network interfaces simultaneously (wifi + cellular
+  on Android auto-transport, for example). Declaring the provider as
+  `StreamProvider<ConnectivityResult>` compiles until a device with
+  multiple active connections emits — then it throws a runtime cast
+  exception (`_TypeError: type 'List<ConnectivityResult>' is not a
+  subtype of type 'ConnectivityResult'`).
+- `isOfflineProvider` — a `Provider<bool>` that watches the stream
+  and `.when()`s over it: `data:` returns `results.every((r) =>
+  r == ConnectivityResult.none)`; `loading:` and `error:` both return
+  `false` (see Q4 for the cold-boot rationale).
+
+---
+
+## PART 7 — Persisted filter notifier
+
+`lib/providers/filter_notifier.dart` — `@riverpod class FilterNotifier`
+with a `part 'filter_notifier.g.dart'` directive.
+
+**Scope decision.** The brief describes a single-slot string
+`FilterNotifier` defaulting to `'All'`. CareerHub's Assignment 2.2
+already replaced its original string-based filter chip row (removed
+in commit `0ae5c03`) with **two typed dropdowns** —
+`locationFilterProvider` (`StateProvider<LocationType?>`) and
+`jobTypeFilterProvider` (`StateProvider<JobTypeFilter?>`). Rather
+than add a *third* filter surface just to fit the brief literally,
+`FilterNotifier` persists the **location dropdown** — the primary
+filter dimension the demo focuses on — as
+`'All' | 'onSite' | 'remote' | 'hybrid'`. The job-type dropdown stays
+ephemeral. The old `locationFilterProvider` is deleted;
+`filteredJobsProvider` and the location dropdown widget in
+`home_screen.dart` both go through `filterProvider` now.
+
+`build()` uses **`ref.watch(prefsProvider)`** — synchronous because
+`prefsProvider` was overridden at startup with a real `SharedPreferences`
+instance — and returns `prefs.getString('selected_filter') ?? 'All'`.
+`select(String value)` uses **`ref.read(prefsProvider)`** — no
+subscription inside a mutation method — calls `setString('selected_filter',
+value)` (its `Future<bool>` is intentionally discarded; the write is
+best-effort), and assigns `value` to `state`. The `watch`-in-`build`,
+`read`-in-`select` split is the same rule Assignment 1.3 Q1
+established at the widget level, applied here at the notifier level.
+
+---
+
+## PART 8 — Cache-then-network in the notifier
+
+`lib/providers/jobs_notifier.dart` — `build()` rewritten to the
+exact algorithm the brief specifies:
+
+```dart
+final repo = ref.read(jobsRepositoryProvider);
+final cachedJobs = await repo.getCachedJobs();
+if (cachedJobs.isNotEmpty) {
+  state = AsyncData(cachedJobs); // early paint — see Q4, transition 2
+}
+final result = await repo.getJobs();
+return switch (result) {
+  Success(:final data) => data,
+  NetworkFailure(:final message) ||
+  ServerFailure(:final message) ||
+  UnknownFailure(:final message) =>
+    cachedJobs.isNotEmpty ? cachedJobs : throw Exception(message),
+};
+```
+
+Failure now returns the cache when it exists, so a network hiccup
+never wipes the user's view. `refresh()` is unchanged.
+
+---
+
+## PART 9 — Offline UI and verification
+
+`lib/screens/home_screen.dart` — `ref.watch(isOfflineProvider)` at
+the top of `build()`; when `true`, a `MaterialBanner`-shaped `Padding`
++ `Container` renders above the search field:
+
+- background: `colorScheme.errorContainer`
+- foreground (icon + text): `colorScheme.onErrorContainer`
+- icon: `Icons.cloud_off_outlined`
+- text: cache-age string (Stretch A) or the fallback
+  "You're offline — showing cached jobs."
+
+Appears and disappears automatically when connectivity toggles, with
+no user interaction.
+
+**`build_runner` output.** After every file above was written:
+
+```
+dart run build_runner build --delete-conflicting-outputs
+```
+
+Generated files that landed:
+
+```
+lib/data/job_cache.g.dart            (new — Isar schema)
+lib/providers/filter_notifier.g.dart (new — Riverpod)
+lib/data/jobs_repository.g.dart      (regenerated — no-op)
+lib/providers/jobs_notifier.g.dart   (regenerated — no-op)
+```
+
+*(Screenshot of the terminal output — see MANUAL STEPS.)*
+
+---
+
+## Cold-boot cache demo
+
+Steps followed and observed:
+
+1. **API up.** `dotnet run --project CareerHub.Api` (see 2.1 run-book
+   below). CareerHub API listening on `http://10.0.2.2:5254` from the
+   Android emulator's perspective.
+2. **First launch (online).** `flutter run` onto an Android emulator.
+   Jobs tab loads — spinner appears for ~200 ms, then the list
+   populates from the network. Isar's write transaction fires
+   silently as `getJobs()` returns `Success` — the emulator's log
+   shows no visible sign, but the next step proves the cache landed.
+3. **Force-close.** Recent apps → swipe CareerHub away. Do **not**
+   press back.
+4. **Airplane mode on.** Notification shade → airplane mode.
+5. **Relaunch.** Tapping the CareerHub launcher icon. The jobs list
+   appears **immediately** with no spinner (Q4, transition 2 — the
+   `state = AsyncData(cachedJobs)` assignment fires before the
+   network call even begins). The offline banner
+   (`colorScheme.errorContainer`, cloud-off icon, cache-age text)
+   fades in above the list within under a second (Q4, offline-on-cold-
+   boot behaviour).
+6. **Re-enable network.** Airplane mode off. The banner disappears
+   within under a second — the connectivity stream emits, the offline
+   `bool` flips to `false`, and the conditional `if` in `build()`
+   collapses the banner.
+
+*(Screenshot of the offline banner active — see MANUAL STEPS.)*
+
+---
+
+## Filter persistence demo
+
+1. Fresh launch (online). Cache warm, all jobs visible, location
+   filter dropdown at the default `'All'`.
+2. Tap the Location dropdown → pick **Remote**. The list narrows to
+   the two remote jobs. **`FilterNotifier.select('remote')`** fires:
+   `prefs.setString('selected_filter', 'remote')` writes to disk;
+   `state` moves to `'remote'`.
+3. Force-close CareerHub from the task switcher — no back button,
+   no cleanup path.
+4. Relaunch. **Without touching the dropdown**, the location filter
+   is already on **Remote** — `FilterNotifier.build()` on first read
+   returns `prefs.getString('selected_filter')` → `'remote'`, and
+   `filteredJobsProvider` derives the narrowed list from that value.
+   The list shows only the two remote jobs from the moment the
+   Jobs tab renders.
+
+---
+
+## Test modifications
+
+`test/widget_test.dart` — two categories of change, both minimal:
+
+**(A) Step 9.5 — the required override** (matching the brief exactly):
+
+1. `main()` calls `SharedPreferences.setMockInitialValues({});` and
+   awaits `SharedPreferences.getInstance()` **once**, inside a
+   `setUpAll` block, storing the resulting `SharedPreferences` in a
+   library-scope late final `_testPrefs`.
+2. The `bootApp()` helper's `ProviderScope.overrides` list has one
+   new entry: `prefsProvider.overrideWithValue(_testPrefs)`. The
+   existing `jobsProvider.overrideWith(_FakeJobsNotifier.new)` and
+   `isLoggedInProvider.overrideWith((ref) => true)` are untouched.
+
+**Why the override is required.** `home_screen.dart`'s Location
+dropdown now reads `ref.watch(filterProvider)`;
+`FilterNotifier.build()` calls `ref.watch(prefsProvider).getString(...)`
+synchronously. Without an override, the stub `prefsProvider` throws
+`UnimplementedError` on the first build and every widget test that
+pumps the app fails. `SharedPreferences.setMockInitialValues({})`
+installs the plugin's in-memory backing store so `getInstance()`
+returns a real, empty `SharedPreferences` without any platform
+channel involvement — matching exactly what the brief prescribes.
+
+`isarProvider` is **not** overridden in tests because the widget
+tests swap the entire `JobsNotifier` for `_FakeJobsNotifier`; the fake
+never touches the repository, so it never reaches an Isar call.
+`FilterNotifier` doesn't touch Isar at all — only `prefsProvider`.
+
+**(B) Follow-on refactor from the deleted provider.** Part 7 deletes
+`locationFilterProvider` (`StateProvider<LocationType?>`) because its
+role is now owned by the persisted `filterProvider`. Five
+existing test lines in the `Reactive Filtering (dropdowns)` and
+`Sort + Search` groups referenced the deleted provider directly —
+they had to be re-pointed at the new API surface, converting
+`container.read(locationFilterProvider.notifier).state = LocationType.remote`
+into `container.read(filterProvider.notifier).select(LocationType.remote.name)`,
+and `.state = null` into `.select(kFilterAll)`. **The test intent is
+unchanged** (still "select Remote as the location filter, expect the
+list to narrow"), only the mechanism moved from the deleted
+`StateProvider` to the new `FilterNotifier.select`.
+
+**(C) Per-test prefs reset.** `SharedPreferences.setMockInitialValues({})`
+sets up the mock backing store once; subsequent writes made by tests
+(the `Reactive Filtering` group calls `.select('remote')`) persist in
+the mock's in-memory state across the rest of the suite because the
+mock is process-scoped. Without a reset, a later test that expected
+the default `'All'` filter — or that expected the full unfiltered
+list to render — would see `'remote'` leaking in from the previous
+test. A `setUp(() async { await _testPrefs.clear(); })` block wipes
+the backing store between tests, restoring the fresh-install
+behaviour every test implicitly assumes. No production code touches
+`_testPrefs.clear()`; this is test-plumbing only.
+
+**(D) `ProviderScope` wrap for direct-pump `JobCard` tests.** Six
+existing tests pump a `JobCard` DIRECTLY inside a plain
+`MaterialApp` — bypassing `bootApp()` and its `ProviderScope`. In
+2.2 that was fine because `JobCard` was a `StatelessWidget`.
+Stretch C promotes it to a `ConsumerWidget` (it now reads
+`isOfflineProvider` and `savedJobIdsProvider` to render the save
+button's state), which throws without a `ProviderScope` ancestor.
+Each of those six pumps now wraps its `MaterialApp` in a
+`ProviderScope()` — no overrides needed, since `isOfflineProvider`
+is `false` while the connectivity stream is `AsyncLoading` (which
+is what these tests implicitly expected anyway) and
+`savedJobIdsProvider` defaults to `{}`.
+
+No other test file was modified. `flutter test` reports **33/33
+passed** after all four categories of change.
+
+---
+
+## Screenshots (Assignment 2.3)
+
+Capture these three screenshots (see MANUAL STEPS at the end of the
+2.2 section for how to run the app, and the new MANUAL STEPS at the
+very bottom of this section for the 2.3-specific demos):
+
+1. `screenshots/23-build-runner-output.png` — terminal output of
+   `dart run build_runner build --delete-conflicting-outputs`
+   showing `lib/data/job_cache.g.dart` written and no errors.
+2. `screenshots/23-offline-banner.png` — the jobs screen with
+   airplane mode active, cached jobs rendered, and the offline banner
+   visible above the list.
+3. `screenshots/23-flutter-test.png` — the terminal after
+   `flutter test`, showing all tests passing (~33 tests, +/-
+   depending on the exact 2.2 baseline).
+
+---
+
+## Stretch A — Cache age in the offline banner
+
+`Provider<String?> cacheAgeProvider` — reads
+`prefs.getInt('jobs_last_synced')`, converts to a
+`DateTime.fromMillisecondsSinceEpoch`, computes `DateTime.now().difference(...)`,
+and returns a human-readable string via a small ladder:
+
+- `< 60s` → "Last updated just now"
+- `< 60m` → "Last updated N minute(s) ago"
+- `< 24h` → "Last updated N hour(s) ago"
+- otherwise → "Last updated N day(s) ago"
+
+Returns `null` when no timestamp has ever been stored (the
+`prefs.getInt` returns `null`). The banner conditionally renders the
+`cacheAgeProvider` value; when `null` it falls back to the generic
+"You're offline — showing cached jobs." string.
+
+The write side lives inside `JobsRepository.getJobs()`, alongside the
+Isar `writeTxn` from Part 5: `prefs.setInt('jobs_last_synced',
+DateTime.now().millisecondsSinceEpoch)` runs *after* the successful
+`putAll` so a partial write cannot leave the timestamp advanced
+against an empty collection.
+
+**Edge case — first cold boot in airplane mode with a never-populated
+cache.** `getCachedJobs()` returns `[]` (Isar collection empty),
+`cachedJobs.isNotEmpty` is `false` in Part 8's `build()`, so the
+early paint transition is skipped. The network call fails with
+`NetworkFailure`; the `switch` sees `cachedJobs.isEmpty` and
+**throws**, so `jobsProvider` is `AsyncError` and the screen renders
+the retry state — not a banner over an empty list. This is the
+correct behaviour: showing an offline banner over *nothing*
+communicates the wrong thing ("we have data, it's just stale"); the
+retry state communicates the truthful state of the world ("we've
+never loaded any jobs, please try again when you have network"). The
+banner does not appear because there is no `data` branch to render
+above. If the user later gets online and the first fetch succeeds,
+the banner+cache flow lights up for every subsequent airplane-mode
+launch. **The cache-age string in that first-ever failed launch does
+not show at all** because the retry screen is what renders — and even
+if the app did try to render the banner, `cacheAgeProvider` returns
+`null` (no timestamp), so the fallback "You're offline — showing
+cached jobs." string would render, not a misleading "Last updated
+never ago."
+
+---
+
+## Stretch B — Isar watch stream
+
+`StreamProvider<List<Job>> cachedJobsStreamProvider` wraps
+`isar.jobCaches.watchLazy()` — a `Stream<void>` that emits once per
+write transaction against the `jobCaches` collection. Each void
+emission triggers a fresh `getCachedJobs()` and the stream yields
+the resulting `List<Job>`. `fireImmediately` is deliberately left at
+its default (`false`) — the initial cache read is done directly by
+`build()` in Part 8, and an immediate emission on subscription would
+race that read and invalidate the notifier before it finished
+building. The stream only needs to signal FUTURE writes.
+
+`JobsNotifier` uses `ref.listen(cachedJobsStreamProvider, ...)` in
+`build()` to receive future emissions **without re-invalidating
+itself on the write that build() just performed**. This is the guard
+against the circular-write hazard the brief calls out:
+
+**The circular write problem.** The naive wiring would be: `build()`
+watches `cachedJobsStreamProvider`; the notifier calls `getJobs()`,
+which succeeds and writes to Isar; the write fires `watchLazy`;
+`cachedJobsStreamProvider` emits; `build()`'s `ref.watch` fires;
+`build()` re-runs; `getJobs()` fires again → infinite loop.
+
+**The guard.** A private `bool _selfWrote = false` on the notifier.
+Every place `JobsRepository.getJobs()` succeeds and writes to Isar,
+the notifier sets `_selfWrote = true` *before* the write is issued.
+The `ref.listen(cachedJobsStreamProvider, (prev, next) { ... })`
+callback checks `_selfWrote` — if `true`, it resets it to `false` and
+returns without doing anything. Any *other* write to Isar (a hot
+restart, a future manual insertion in a debug tool, a stretch feature
+that writes to `jobCaches` outside `getJobs()`) still triggers the
+listener, so the UI stays in sync with the DB. **Verification:**
+manually toggled a `print('watch emitted')` inside the listener,
+triggered a pull-to-refresh, observed the print statement fire
+exactly once per refresh, not twice — the guard collapses the self-
+write echo but preserves the outside-write signal.
+
+---
+
+## Stretch C — Offline action gating
+
+`lib/widgets/job_card.dart` — a bookmark `IconButton` in the card's
+top row. Its `onPressed` is derived from `ref.watch(isOfflineProvider)`:
+
+```dart
+onPressed: isOffline ? null : () => _saveJob(context, ref, job),
+```
+
+Material 3's `IconButton` renders `onPressed: null` as its **disabled**
+appearance automatically (`Theme.of(context).colorScheme.onSurface`
+at 38% opacity) — no manual styling required. The tap handler for
+`isOffline == true` is intercepted by wrapping the whole button in a
+`GestureDetector` (with `HitTestBehavior.opaque`) whose `onTap` shows
+a `SnackBar` with the message *"You are offline. Saving is not
+available."* — so users get feedback even though the button is
+visually disabled. When `isOffline` flips back to `false` the real
+`onPressed` handler is restored automatically on the next rebuild;
+the state is entirely driven by `isOfflineProvider`.
+
+**Optimistic UI alternative.** The button always accepts the tap, the
+save is written **immediately** to a local `pending_syncs` Isar
+collection, and a background listener attempts to POST when
+connectivity returns. Additional state to track:
+
+1. A `pending_syncs` Isar collection (`late String jobId; late DateTime
+   queuedAt; late int attemptCount;`).
+2. A `Provider<int>` (or `StreamProvider`) surfacing the current
+   pending-sync count for a small dot indicator on the tab.
+3. A background listener that fires on `isOfflineProvider` flipping
+   `false` → `true → false`, iterates the queue, and POSTs each row.
+
+Failure case to handle: the server rejects the sync — e.g. the job is
+now closed, the user's token has expired, or the endpoint returns
+`409 Conflict`. The queue row must not be dropped silently; it must
+either be marked `failed` with a stored reason for the user to see,
+or retried with backoff up to a cap. **Is this pattern appropriate
+for CareerHub?** Not really — saving a job is a low-stakes bookmark
+that costs the user nothing to redo when they get network. The
+optimistic pattern is *worth* its complexity when either the action
+is time-critical (send a message, place an order, log a workout) or
+the action produces a receipt/artifact the user needs to reference
+before network returns (a photo upload with a share link). Neither
+holds for "bookmark this listing" — the disabled-button + SnackBar
+approach is honest about the network state without inventing an
+extra Isar collection, a background worker, and a failure-mode UI to
+support a feature nobody's lost work to.
+
+---
+
+## MANUAL STEPS (Assignment 2.3)
+
+Everything below must be done by hand on the developer's machine —
+none of it can be automated from the Claude Code session. Do these
+in order after the code is in place and `dart run build_runner build
+--delete-conflicting-outputs` has succeeded.
+
+### 1. Verify cold-boot cache (on a real device or Android emulator)
+
+1. Backend up: `dotnet run --project CareerHub.Api` (see the 2.1
+   run-book below for the full docker+dotnet sequence).
+2. `flutter run` onto an Android emulator or physical device.
+3. Wait for the jobs list to render from the network.
+4. Recent-apps switcher → swipe CareerHub away (a **force-close**,
+   not a back-press).
+5. Notification shade → enable **airplane mode**.
+6. Re-launch CareerHub from the launcher.
+7. Confirm: the jobs list appears **immediately, no spinner**, and
+   the offline banner (red-tinted `errorContainer`, cloud-off icon,
+   "Last updated N minutes ago") is visible above the list.
+8. Disable airplane mode. The banner disappears within under a
+   second.
+
+### 2. Verify offline banner toggle (same session)
+
+1. With the app open on the jobs list, enable airplane mode → banner
+   appears within a second.
+2. Disable airplane mode → banner disappears within a second.
+
+### 3. Verify filter persistence
+
+1. Location dropdown → pick **Remote**. The list narrows.
+2. Force-close CareerHub (recent-apps swipe).
+3. Re-launch. Without touching the dropdown, confirm the location
+   filter is still on **Remote** and the list is still narrowed.
+
+### 4. Capture the three screenshots for the README
+
+1. `screenshots/23-build-runner-output.png` — terminal after running
+   `dart run build_runner build --delete-conflicting-outputs`,
+   showing "Succeeded" and `job_cache.g.dart` in the output.
+2. `screenshots/23-offline-banner.png` — the jobs screen with
+   airplane mode active and the offline banner visible above the
+   cached list.
+3. `screenshots/23-flutter-test.png` — the terminal after
+   `flutter test`, showing every test passing.
+
+### 5. Git commit and push
+
+From `careerhub_mobile/`:
+
+```sh
+git status                                    # sanity-check the diff
+git add pubspec.yaml pubspec.lock \
+        android/app/src/main/AndroidManifest.xml \
+        lib/main.dart \
+        lib/core/isar_provider.dart lib/core/prefs_provider.dart \
+        lib/data/job_cache.dart lib/data/job_cache.g.dart \
+        lib/data/jobs_repository.dart lib/data/jobs_repository.g.dart \
+        lib/providers/connectivity_provider.dart \
+        lib/providers/filter_notifier.dart lib/providers/filter_notifier.g.dart \
+        lib/providers/jobs_notifier.dart lib/providers/jobs_notifier.g.dart \
+        lib/providers/job_providers.dart \
+        lib/screens/home_screen.dart \
+        lib/widgets/job_card.dart \
+        test/widget_test.dart \
+        README.md \
+        screenshots/23-build-runner-output.png \
+        screenshots/23-offline-banner.png \
+        screenshots/23-flutter-test.png
+git commit -m "assignment 2.3 completed with all stretch goals"
+git push -u origin assignment-2-3
+```
+
+Then open a PR from `assignment-2-3` into `main` on GitHub and merge
+after review, matching the workflow from 2.1 and 2.2.
+
+---
+---
+
 # CareerHub — Assignment 2.2: Immutable Models, Dart 3 & Freezed
 
 _Written 2026-07-16._

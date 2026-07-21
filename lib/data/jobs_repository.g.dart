@@ -56,20 +56,38 @@ final class DioProvider extends $FunctionalProvider<Dio, Dio, Dio>
 
 String _$dioHash() => r'4f90e1ca19e25080c2d142f3c317502da628590a';
 
-/// Assignment 2.1 — the repository provider. Wires the singleton Dio
-/// into [JobsRepository].
+/// Assignment 2.1 → 2.3 — the repository provider. Wires the singleton
+/// Dio, the singleton Isar instance, and the singleton SharedPreferences
+/// instance into [JobsRepository].
+///
+/// Assignment 2.3 change: this provider now also watches
+/// [isarProvider] and [prefsProvider] — both of which are overridden
+/// in `main.dart` with real, opened instances before `runApp`. See
+/// README 2.3, Part 5.
 
 @ProviderFor(jobsRepository)
 const jobsRepositoryProvider = JobsRepositoryProvider._();
 
-/// Assignment 2.1 — the repository provider. Wires the singleton Dio
-/// into [JobsRepository].
+/// Assignment 2.1 → 2.3 — the repository provider. Wires the singleton
+/// Dio, the singleton Isar instance, and the singleton SharedPreferences
+/// instance into [JobsRepository].
+///
+/// Assignment 2.3 change: this provider now also watches
+/// [isarProvider] and [prefsProvider] — both of which are overridden
+/// in `main.dart` with real, opened instances before `runApp`. See
+/// README 2.3, Part 5.
 
 final class JobsRepositoryProvider
     extends $FunctionalProvider<JobsRepository, JobsRepository, JobsRepository>
     with $Provider<JobsRepository> {
-  /// Assignment 2.1 — the repository provider. Wires the singleton Dio
-  /// into [JobsRepository].
+  /// Assignment 2.1 → 2.3 — the repository provider. Wires the singleton
+  /// Dio, the singleton Isar instance, and the singleton SharedPreferences
+  /// instance into [JobsRepository].
+  ///
+  /// Assignment 2.3 change: this provider now also watches
+  /// [isarProvider] and [prefsProvider] — both of which are overridden
+  /// in `main.dart` with real, opened instances before `runApp`. See
+  /// README 2.3, Part 5.
   const JobsRepositoryProvider._()
     : super(
         from: null,
@@ -103,4 +121,4 @@ final class JobsRepositoryProvider
   }
 }
 
-String _$jobsRepositoryHash() => r'1c2a541b1de41cf94b90563bc35664d9d7b01b1c';
+String _$jobsRepositoryHash() => r'addf946d561648706656b7eb34fa28a9f03e02eb';

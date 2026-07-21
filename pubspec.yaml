@@ -1,5 +1,5 @@
 name: careerhub_mobile
-description: "CareerHub — Week 2 Assignment 2.2: Immutable Models, Dart 3 & Freezed."
+description: "CareerHub — Week 2 Assignment 2.3: Local Persistence and Offline-First."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -33,6 +33,35 @@ dependencies:
   # json_serializable) are dev-only. See README 2.2, Q2.
   freezed_annotation: ^3.0.0
   json_annotation: ^4.9.0
+  # Assignment 2.3 — the Isar embedded database (Part 2). Using the
+  # community-maintained fork (`isar_community`, `isar_community_flutter_libs`,
+  # `isar_community_generator`) rather than the original `isar` packages
+  # because the original Isar 3.1 generator pins `analyzer <6.0.0` and
+  # `source_gen ^1.2.2`, both of which conflict with our existing
+  # `riverpod_generator ^3.0.0` (which needs `source_gen >=3.0.0`). The
+  # community fork is a drop-in — same @collection, same Isar.open, same
+  # writeTxn/putAll API — that supports the modern analyzer + source_gen
+  # combination. The runtime API surface is identical; only the import
+  # path is `package:isar_community/isar.dart` instead of
+  # `package:isar/isar.dart`. `isar_community_flutter_libs` still bundles
+  # the compiled native binary (libisar.so on Android, libisar.dylib on
+  # iOS) at BUILD time — MUST live in `dependencies:` (not
+  # `dev_dependencies:`): if it were dev-only the project would compile
+  # and install without warning, then crash at first read with a
+  # dynamic-library-load error the moment Isar tried to dlopen its
+  # native binary. See README 2.3, Part 2.
+  isar_community: ^3.3.0
+  isar_community_flutter_libs: ^3.3.0
+  # Assignment 2.3 — `path_provider` exposes the app's documents directory via
+  # a platform channel, which is where Isar writes its `.isar` file at boot.
+  path_provider: ^2.1.4
+  # Assignment 2.3 — key/value store for the persisted filter (Part 7) and
+  # the cache-age timestamp (Stretch A).
+  shared_preferences: ^2.3.2
+  # Assignment 2.3 — reachability stream (Part 6). Emits a
+  # `List<ConnectivityResult>` (plural) as of 5.0 because a device can be
+  # reachable through multiple network interfaces at once.
+  connectivity_plus: ^6.1.0
 
 dev_dependencies:
   flutter_test:
@@ -44,10 +73,16 @@ dev_dependencies:
   # ship the output, not the toolchain.
   build_runner: ^2.4.13
   riverpod_generator: ^3.0.0
-  # Riverpod 3's lint rules — surfaces `avoid_manual_providers_as_generated_provider_dependency`
-  # and friends. Runs under the same custom_lint host.
-  custom_lint: ^0.8.1
-  riverpod_lint: ^3.0.0
+  # Assignment 2.3 note — `custom_lint` and `riverpod_lint` were removed
+  # temporarily because they pin `analyzer: ^8.0.0`, which conflicts with
+  # `isar_generator`'s `analyzer >=4.6.0 <6.0.0` constraint. The two are
+  # pure lint tools (they surface extra style warnings but do not
+  # participate in compilation or the build_runner code-generation
+  # pipeline). Nothing about the app's runtime or tests depends on them,
+  # so lifting them out is the cheapest way to satisfy Isar's analyzer
+  # constraint without switching to community forks or overriding
+  # analyzer's version. Restore them once Isar's official generator
+  # supports analyzer 8.
   # Assignment 2.2 — dev-only code generators. `freezed` emits the
   # `*.freezed.dart` mixin (with ==, hashCode, copyWith, toString);
   # `json_serializable` emits the `*.g.dart` file with the
@@ -55,6 +90,14 @@ dev_dependencies:
   # compiled app — only the generated Dart source they produce does.
   freezed: ^3.0.0
   json_serializable: ^6.9.0
+  # Assignment 2.3 — reads @collection classes and emits *.g.dart with the
+  # schema descriptor + native binary encoders/decoders + typed query API.
+  # Dev-only because only the emitted Dart source ships in the compiled app,
+  # never the generator itself. Using the community fork
+  # (`isar_community_generator`) rather than the original `isar_generator`
+  # because the original pins an analyzer/source_gen combination
+  # incompatible with `riverpod_generator ^3.0.0`. See README 2.3, Part 2.
+  isar_community_generator: ^3.3.0
 
 flutter:
   uses-material-design: true

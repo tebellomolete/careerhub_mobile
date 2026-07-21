@@ -1,4 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Assignment 2.3 — connectivity_plus reads Android's network state
+         through ConnectivityManager / NetworkCapabilities APIs, which are
+         gated by this permission. Without it the connectivity stream
+         initialises silently but never emits a change event, so the
+         offline banner never appears on Android. Must sit immediately
+         before <application>. See README 2.3, Part 2. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Assignment 2.1 — usesCleartextTraffic="true".
          Our CareerHub API runs on http://10.0.2.2:5254 in development
          (the Android emulator's alias for the host machine's localhost).

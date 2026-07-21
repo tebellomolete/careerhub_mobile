@@ -1,11 +1,17 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 // StateProvider moved out of the main flutter_riverpod.dart import as of
 // Riverpod 3.0 (it's now "legacy" — discouraged in favour of Notifier,
-// but fully supported). We use it deliberately here anyway: see the
-// justification on each StateProvider below and README Q2.
+// but fully supported). Several providers in this file still use it
+// deliberately (sortOrderProvider, searchQueryProvider, savedJobIdsProvider,
+// isLoggedInProvider, editedJobProvider, jobTypeFilterProvider): the
+// location-filter provider that used to live here was replaced in
+// Assignment 2.3 by the persisted `filterProvider` (see
+// `lib/providers/filter_notifier.dart` and README 2.3, Part 7), so
+// `LocationType` no longer needs to be a `StateProvider` value.
 import 'package:flutter_riverpod/legacy.dart';
 
 import '../models/job.dart';
+import 'filter_notifier.dart';
 import 'jobs_notifier.dart';
 
 /// Assignment 2.1 — this file used to own the `_mockJobs` list, the
@@ -21,14 +27,23 @@ import 'jobs_notifier.dart';
 ///     second, redundant path.
 ///
 /// What remains here is exactly the SLICE OF UI STATE the screens own:
-/// which filter is selected, which sort order, what's in the search box,
-/// which jobs the user has saved. None of it fetches data.
-
-/// ---------------------------------------------------------------------
-/// Provider 2a — the currently selected LOCATION filter dropdown value.
-/// ---------------------------------------------------------------------
-final locationFilterProvider =
-    StateProvider<LocationType?>((ref) => null);
+/// which filter is selected (job-type only — location is persisted
+/// via `filterProvider`, see below), which sort order, what's
+/// in the search box, which jobs the user has saved. None of it
+/// fetches data.
+///
+/// Assignment 2.3 change:
+///   - The old `locationFilterProvider` (`StateProvider<LocationType?>`)
+///     is DELETED. Its role is subsumed by the persisted
+///     `filterProvider` in `lib/providers/filter_notifier.dart`,
+///     which stores the selection as `'All' | 'onSite' | 'remote' |
+///     'hybrid'` in SharedPreferences so it survives force-close.
+///   - `filteredJobsProvider` now watches `filterProvider` and
+///     converts its String value to a `LocationType?` at derivation
+///     time, keeping the filter predicate itself unchanged in shape.
+///   - The job-type dropdown remains a plain `StateProvider` — the
+///     assignment brief specifies a single filter to persist and
+///     adding a second persistence surface would over-scope Part 7.
 
 /// The set of employment-type labels the Job Type dropdown exposes. Kept
 /// as a String because employmentType on Job is already a String — after
@@ -45,18 +60,39 @@ enum JobTypeFilter {
 }
 
 /// ---------------------------------------------------------------------
-/// Provider 2b — the currently selected JOB TYPE filter dropdown value.
+/// Provider — the currently selected JOB TYPE filter dropdown value.
+/// Ephemeral. See class-header comment for why it is NOT persisted.
 /// ---------------------------------------------------------------------
 final jobTypeFilterProvider =
     StateProvider<JobTypeFilter?>((ref) => null);
 
+/// Assignment 2.3, Part 7 — convert the persisted filter String
+/// (`'All' | 'onSite' | 'remote' | 'hybrid'`) into a `LocationType?`
+/// for the filter predicate. Kept as a free helper (not a method on
+/// an enum) so `LocationType` in `models/job.dart` stays free of
+/// filter-persistence concerns.
+LocationType? _locationTypeFromFilter(String filter) {
+  if (filter == kFilterAll) return null;
+  for (final value in LocationType.values) {
+    if (value.name == filter) return value;
+  }
+  return null;
+}
+
 /// ---------------------------------------------------------------------
 /// Provider 3 — the filtered job list, derived from the async job list
-/// plus the two dropdown filters.
+/// plus the persisted location filter and the ephemeral job-type filter.
+///
+/// Assignment 2.3 change: watches `filterProvider` (a String)
+/// and derives the effective `LocationType?` via
+/// `_locationTypeFromFilter`. The filter predicate on `job.locationType`
+/// is unchanged in shape.
 /// ---------------------------------------------------------------------
 final filteredJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
   final jobsAsync = ref.watch(jobsProvider);
-  final locationFilter = ref.watch(locationFilterProvider);
+  final locationFilter = _locationTypeFromFilter(
+    ref.watch(filterProvider),
+  );
   final jobTypeFilter = ref.watch(jobTypeFilterProvider);
 
   return jobsAsync.whenData((jobs) {

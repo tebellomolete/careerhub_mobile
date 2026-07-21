@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:careerhub_mobile/core/prefs_provider.dart';
 import 'package:careerhub_mobile/main.dart';
 import 'package:careerhub_mobile/models/job.dart';
+import 'package:careerhub_mobile/providers/filter_notifier.dart';
 import 'package:careerhub_mobile/providers/job_providers.dart';
 import 'package:careerhub_mobile/providers/jobs_notifier.dart';
 import 'package:careerhub_mobile/widgets/job_card.dart';
@@ -102,13 +105,32 @@ final List<Job> _fakeJobs = [
   ),
 ];
 
-/// Assignment 2.1 — the boot helper.
+/// Assignment 2.3 — the mock SharedPreferences instance the boot
+/// helper injects into `prefsProvider`.
 ///
-/// Two overrides:
+/// Populated once in `setUpAll` below via
+/// `SharedPreferences.setMockInitialValues({})` + `getInstance()`.
+/// This is exactly the pattern Step 9.5 of Assignment 2.3 prescribes.
+///
+/// **Why this override is required in 2.3.** `home_screen.dart` now
+/// reads `filterProvider`, which itself synchronously reads
+/// `prefsProvider.getString(...)`. The stub `prefsProvider` in
+/// `lib/core/prefs_provider.dart` throws `UnimplementedError` on
+/// read; without this override, every widget test that pumps the app
+/// would fail on the first build. `isarProvider` is NOT overridden
+/// because `_FakeJobsNotifier` below replaces the entire notifier —
+/// no code path in the test reaches the repository, and therefore
+/// none reaches Isar.
+late final SharedPreferences _testPrefs;
+
+/// Assignment 2.1 → 2.3 — the boot helper.
+///
+/// Three overrides:
 ///   1. `jobsProvider` → `_FakeJobsNotifier` so no HTTP call
-///      ever leaves the test process (Part 6, and README Q4).
+///      ever leaves the test process (2.1 Part 6, and README Q4).
 ///   2. `isLoggedInProvider` → true so the router's Stretch-C redirect
 ///      allows the freshly-pumped app onto `/jobs` (unchanged from 1.4).
+///   3. `prefsProvider` → the mock `_testPrefs` (added in 2.3, Step 9.5).
 Widget bootApp() {
   return ProviderScope(
     overrides: [
@@ -121,6 +143,7 @@ Widget bootApp() {
       // [savedJobsProvider]) still runs unchanged. See README, Q4.
       jobsProvider.overrideWith(_FakeJobsNotifier.new),
       isLoggedInProvider.overrideWith((ref) => true),
+      prefsProvider.overrideWithValue(_testPrefs),
     ],
     child: const CareerHubApp(),
   );
@@ -142,6 +165,26 @@ Future<void> pumpLoadedApp(
 }
 
 void main() {
+  // Assignment 2.3, Step 9.5 — install the SharedPreferences plugin's
+  // in-memory mock backing store once, then reset it between tests.
+  // The mock is process-scoped, so once a test writes
+  // `selected_filter=remote` via `FilterNotifier.select`, every
+  // later test in the same suite reads that same value unless we
+  // reset — leaking state between tests. `clear()` on the same
+  // instance zeroes the backing store without needing a fresh
+  // `SharedPreferences.getInstance()` (which would leave dangling
+  // references in overrides that captured the old handle).
+  setUpAll(() async {
+    SharedPreferences.setMockInitialValues({});
+    _testPrefs = await SharedPreferences.getInstance();
+  });
+
+  setUp(() async {
+    // Wipe every key the app might have written. Cheap; no I/O in
+    // the mock backend.
+    await _testPrefs.clear();
+  });
+
   group('CareerHub App Shell', () {
     testWidgets('CareerHubApp builds without error',
         (WidgetTester tester) async {
@@ -263,8 +306,14 @@ void main() {
       await pumpLoadedApp(tester);
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
 
-      containerFor(tester).read(locationFilterProvider.notifier).state =
-          LocationType.remote;
+      // Assignment 2.3, Part 7 — the location filter now lives in
+      // the persisted `filterProvider` (String), not the
+      // deleted `locationFilterProvider` (LocationType?). The
+      // notifier's `.select(...)` handles both the prefs write and
+      // the state update.
+      containerFor(tester)
+          .read(filterProvider.notifier)
+          .select(LocationType.remote.name);
       await tester.pump();
 
       expect(find.text('Senior Flutter Developer'), findsNothing);
@@ -277,12 +326,14 @@ void main() {
       await pumpLoadedApp(tester);
 
       final container = containerFor(tester);
-      container.read(locationFilterProvider.notifier).state =
-          LocationType.remote;
+      container
+          .read(filterProvider.notifier)
+          .select(LocationType.remote.name);
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsNothing);
 
-      container.read(locationFilterProvider.notifier).state = null;
+      // Clearing = writing the `kFilterAll` sentinel back.
+      container.read(filterProvider.notifier).select(kFilterAll);
       await tester.pump();
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
     });
@@ -293,8 +344,9 @@ void main() {
       await pumpLoadedApp(tester);
       final container = containerFor(tester);
 
-      container.read(locationFilterProvider.notifier).state =
-          LocationType.remote;
+      container
+          .read(filterProvider.notifier)
+          .select(LocationType.remote.name);
       container.read(jobTypeFilterProvider.notifier).state =
           JobTypeFilter.fullTime;
       await tester.pump();
@@ -311,7 +363,8 @@ void main() {
         'updates the provider', (WidgetTester tester) async {
       await pumpLoadedApp(tester);
       final container = containerFor(tester);
-      expect(container.read(locationFilterProvider), isNull);
+      // Default = the `kFilterAll` sentinel.
+      expect(container.read(filterProvider), kFilterAll);
 
       await tester
           .tap(find.byType(DropdownButtonFormField<LocationType?>));
@@ -320,7 +373,9 @@ void main() {
       await tester.tap(find.text('Remote').last);
       await tester.pumpAndSettle();
 
-      expect(container.read(locationFilterProvider), LocationType.remote);
+      // The dropdown's `.select(...)` writes the enum name.
+      expect(container.read(filterProvider),
+          LocationType.remote.name);
       expect(find.text('Senior Flutter Developer'), findsNothing);
     });
   });
@@ -332,8 +387,9 @@ void main() {
 
       final container = ProviderScope.containerOf(
           tester.element(find.byType(CareerHubApp)));
-      container.read(locationFilterProvider.notifier).state =
-          LocationType.remote;
+      container
+          .read(filterProvider.notifier)
+          .select(LocationType.remote.name);
       await tester.pump();
 
       double dxOf(String title) => tester.getTopLeft(find.text(title)).dx;
@@ -417,9 +473,19 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: JobCard(job: testJob),
+        // Assignment 2.3, Stretch C — JobCard is now a `ConsumerWidget`
+        // (reads `isOfflineProvider` and `savedJobIdsProvider` to render
+        // the save button's online/offline state). Direct-pump tests
+        // therefore need a `ProviderScope` wrapper — same reason 1.3
+        // added one for the app-shell tests. No overrides needed:
+        // isOfflineProvider is `false` while its stream is loading, and
+        // savedJobIdsProvider defaults to `{}` — both are exactly what
+        // the pre-Stretch-C assertions implicitly assumed.
+        ProviderScope(
+          child: MaterialApp(
+            home: Scaffold(
+              body: JobCard(job: testJob),
+            ),
           ),
         ),
       );
@@ -444,9 +510,12 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: JobCard(job: minimalJob),
+        // See Stretch-C note above.
+        ProviderScope(
+          child: MaterialApp(
+            home: Scaffold(
+              body: JobCard(job: minimalJob),
+            ),
           ),
         ),
       );
@@ -469,9 +538,12 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: JobCard(job: jobWithDesc),
+        // See Stretch-C note above.
+        ProviderScope(
+          child: MaterialApp(
+            home: Scaffold(
+              body: JobCard(job: jobWithDesc),
+            ),
           ),
         ),
       );
@@ -562,10 +634,13 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          theme: ThemeData.light(useMaterial3: true),
-          home: Scaffold(
-            body: JobCard(job: testJob),
+        // See Stretch-C note in the JobCard Widget group above.
+        ProviderScope(
+          child: MaterialApp(
+            theme: ThemeData.light(useMaterial3: true),
+            home: Scaffold(
+              body: JobCard(job: testJob),
+            ),
           ),
         ),
       );
@@ -587,10 +662,13 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          theme: ThemeData.dark(useMaterial3: true),
-          home: Scaffold(
-            body: JobCard(job: testJob),
+        // See Stretch-C note in the JobCard Widget group above.
+        ProviderScope(
+          child: MaterialApp(
+            theme: ThemeData.dark(useMaterial3: true),
+            home: Scaffold(
+              body: JobCard(job: testJob),
+            ),
           ),
         ),
       );
