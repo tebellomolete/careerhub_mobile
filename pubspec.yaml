@@ -75,6 +75,43 @@ dependencies:
   # enrolled biometrics (see AuthNotifier for the branching).
   local_auth: ^2.3.0
 
+  # Assignment 3.1 — the five new packages introduced by Parts 5–7.
+  # Every one is a pure runtime library — no code generation, no
+  # part directives, no dev-dep counterpart. See README 3.1
+  # "build_runner note" for the full rationale.
+  #
+  # `flutter_hooks` supplies useTextEditingController / useMemoized /
+  # useState / useEffect (Parts 5–7 and Stretch B). `hooks_riverpod`
+  # is the Riverpod integration — its HookConsumerWidget subclasses
+  # HookWidget AND ConsumerWidget so a single class can host both
+  # hooks and provider watches, which is exactly what LoginScreen
+  # (Part 5) and ApplyScreen (Part 7) need. `hooks_riverpod`
+  # re-exports the entire Riverpod 3 API surface, so files that
+  # continue to use ConsumerWidget can keep importing
+  # flutter_riverpod — the two coexist without conflict against the
+  # same ProviderScope. Pinned to `^3.0.0` to match the existing
+  # `flutter_riverpod: ^3.0.0` and `riverpod_annotation: ^3.0.0`
+  # already in this file — hooks_riverpod follows Riverpod's
+  # version numbering exactly.
+  flutter_hooks: ^0.21.2
+  hooks_riverpod: ^3.0.0
+  # `shimmer` — Part 6. Wraps children in a ShaderMask that sweeps
+  # a linear gradient horizontally; the child widgets themselves
+  # are static (Containers with Colors.white in our JobsShimmer),
+  # the animated colour effect comes from the mask alone.
+  shimmer: ^3.0.0
+  # `flutter_form_builder` + `form_builder_validators` — Part 7's
+  # apply form. `flutter_form_builder` supplies FormBuilder /
+  # FormBuilderTextField / FormBuilderDateTimePicker /
+  # FormBuilderCheckbox and centralises field state on a
+  # FormBuilderState accessible via GlobalKey (see README 3.1 Q4
+  # on save-before-validate ordering). `form_builder_validators`
+  # is the companion library of composable validators
+  # (required, minLength, email, url, compose) called out in
+  # Part 7.5.
+  flutter_form_builder: ^10.0.1
+  form_builder_validators: ^11.1.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

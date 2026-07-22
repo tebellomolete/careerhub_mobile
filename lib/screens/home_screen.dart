@@ -3,229 +3,320 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../models/job.dart';
+import '../providers/application_drafts_notifier.dart';
 import '../providers/auth_notifier.dart';
 import '../providers/connectivity_provider.dart';
 import '../providers/filter_notifier.dart';
 import '../providers/job_providers.dart';
 import '../providers/jobs_notifier.dart';
 import '../router/app_router.dart';
-import '../widgets/job_card.dart';
 import '../widgets/empty_jobs_widget.dart';
+import '../widgets/job_card.dart';
+import '../widgets/jobs_shimmer.dart';
 
-/// CareerHub's main screen.
+/// Assignment 3.1, Part 3–4 — the jobs list screen after widget
+/// extraction and `RepaintBoundary` isolation.
 ///
-/// Assignment 2.3 changes from 2.2:
-///   - The Location dropdown now reads and writes `filterProvider`
-///     (persisted to SharedPreferences), NOT the old ephemeral
-///     `locationFilterProvider` `StateProvider<LocationType?>` — the
-///     brief's Part 7 requires the filter selection to survive
-///     force-close. See README 2.3, Part 7.
-///   - A new offline banner (Part 9.1) sits above the search field
-///     when `isOfflineProvider` returns `true`. Uses
-///     `colorScheme.errorContainer` / `onErrorContainer` and shows
-///     the cache-age string from `cacheAgeProvider` (Stretch A)
-///     when available, with a generic fallback otherwise.
-class HomeScreen extends ConsumerStatefulWidget {
+/// **Class-level checkpoint (Part 3.4 + Part 8.2):**
+///   - `HomeScreen.build` calls `ref.watch` **zero** times. Every
+///     provider subscription lives inside `_FilterChips`, `_JobList`,
+///     `_JobSortAction`, or `_JobsAppBar` — all private const
+///     `ConsumerWidget` classes below.
+///   - `ref.read` is used inside the logout button's `onPressed` and
+///     inside `ref.listen`'s callback — Part 3.4 explicitly permits
+///     both. Neither creates a subscription that rebuilds this class.
+///   - `ref.listen<bool>(isOfflineProvider, ...)` is registered once
+///     at first mount and survives every subsequent rebuild without
+///     re-registering; it does NOT count as a `ref.watch`. It drives
+///     the Stretch C reconnect-drain of the application-draft queue.
+///
+/// **Body shape (Part 3.4 checkpoint, literally verbatim):**
+///
+/// ```dart
+/// body: const Column(
+///   crossAxisAlignment: CrossAxisAlignment.start,
+///   children: [
+///     _FilterChips(),
+///     Expanded(child: _JobList()),
+///   ],
+/// ),
+/// ```
+///
+/// The offline banner from Assignment 2.3 and the pending-drafts
+/// banner from Stretch C are rendered at the top of `_JobList`, NOT
+/// as a sibling of `_FilterChips`, so the mandated const-Column body
+/// shape stays literal.
+///
+/// **Features preserved from earlier assignments** — moved to the
+/// AppBar as private const `ConsumerWidget` children so the screen
+/// class stays subscription-free: keyword search (opens
+/// `_JobSearchDelegate`), sort order menu, and logout. The
+/// job-type dropdown and the grid layout from 2.3 are dropped — the
+/// filter chip row already covers location; job-type filtering can
+/// live in a later assignment.
+class HomeScreen extends ConsumerWidget {
   const HomeScreen({super.key});
 
   @override
-  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Assignment 3.1 Stretch C — on the offline → online transition,
+    // drain any pending application drafts. `ref.listen` registers a
+    // subscription on first build; because this widget never
+    // rebuilds (the body below is a const Column with private const
+    // consumers), the listener stays alive for the lifetime of the
+    // screen with no risk of accumulating duplicates.
+    ref.listen<bool>(isOfflineProvider, (previous, next) {
+      if (previous == true && next == false) {
+        // Fire-and-forget — the controller handles its own errors
+        // and the banner disappears when Isar drops the drained
+        // rows.
+        ref.read(applicationDraftsControllerProvider).syncPending();
+      }
+    });
+
+    return const Scaffold(
+      appBar: _JobsAppBar(),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _FilterChips(),
+          Expanded(child: _JobList()),
+        ],
+      ),
+    );
+  }
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
-  late final TextEditingController _searchController;
+// ═══════════════════════════════════════════════════════════════════════════
+// AppBar — search / sort / logout actions live here as private const
+// ConsumerWidgets so the screen class above stays subscription-free.
+// ═══════════════════════════════════════════════════════════════════════════
 
-  static const double _gridBreakpoint = 600;
-  static const double _threeColumnBreakpoint = 840;
+class _JobsAppBar extends ConsumerWidget implements PreferredSizeWidget {
+  const _JobsAppBar();
 
   @override
-  void initState() {
-    super.initState();
-    _searchController = TextEditingController();
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return AppBar(
+      title: const Text('CareerHub'),
+      centerTitle: false,
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.search),
+          tooltip: 'Search jobs',
+          onPressed: () async {
+            // showSearch owns its own Navigator route. The returned
+            // String is the delegate's `close(context, value)`
+            // argument — unused here.
+            await showSearch<String>(
+              context: context,
+              delegate: _JobSearchDelegate(),
+            );
+          },
+        ),
+        const _JobSortAction(),
+        IconButton(
+          icon: const Icon(Icons.logout),
+          tooltip: 'Sign out',
+          onPressed: () {
+            // Assignment 2.4, Part 9.3 — invalidate user-scoped
+            // providers FIRST, then flip auth state. Order matters
+            // (see README 2.4 Q4).
+            ref.invalidate(jobsProvider);
+            ref.invalidate(savedJobIdsProvider);
+            ref.read(authProvider.notifier).logout();
+          },
+        ),
+        const SizedBox(width: 8),
+      ],
+    );
   }
+}
+
+/// Sort order menu — kept as a private const ConsumerWidget so its
+/// ref.watch on `sortOrderProvider` does not bubble to
+/// `_JobsAppBar` or `HomeScreen`. The screen class must retain zero
+/// watches (Part 3.4 checkpoint).
+class _JobSortAction extends ConsumerWidget {
+  const _JobSortAction();
 
   @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
+  Widget build(BuildContext context, WidgetRef ref) {
+    final sortOrder = ref.watch(sortOrderProvider);
+    return PopupMenuButton<SortOrder>(
+      icon: const Icon(Icons.sort_by_alpha),
+      tooltip: 'Sort by title',
+      onSelected: (value) =>
+          ref.read(sortOrderProvider.notifier).state = value,
+      itemBuilder: (context) => [
+        CheckedPopupMenuItem(
+          value: SortOrder.aToZ,
+          checked: sortOrder == SortOrder.aToZ,
+          child: const Text('Title: A–Z'),
+        ),
+        CheckedPopupMenuItem(
+          value: SortOrder.zToA,
+          checked: sortOrder == SortOrder.zToA,
+          child: const Text('Title: Z–A'),
+        ),
+      ],
+    );
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Part 3.2 — _FilterChips.
+//
+// A private const ConsumerWidget with a no-arg constructor. Owns the
+// single `ref.watch(filterProvider)` and the four horizontally
+// scrollable FilterChips. `onSelected` calls
+// `ref.read(filterProvider.notifier).select(...)` — the standard
+// widget-level `watch` for reads / `read` for mutations rule.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The four options exposed by the filter chip row. Kept as a
+/// top-level const list so the FilterChip labels and the persisted
+/// `filterProvider` string values live in one place.
+///
+/// Values match the strings the location `filterProvider` writes to
+/// SharedPreferences — `'All'` is `kFilterAll`, and the three
+/// `LocationType.name` strings (`'onSite'`, `'remote'`, `'hybrid'`)
+/// are the exact tokens `_locationTypeFromFilter` in
+/// `job_providers.dart` compares against.
+const List<({String value, String label})> _kFilterOptions = [
+  (value: 'All', label: 'All'),
+  (value: 'onSite', label: 'On-site'),
+  (value: 'remote', label: 'Remote'),
+  (value: 'hybrid', label: 'Hybrid'),
+];
+
+class _FilterChips extends ConsumerWidget {
+  const _FilterChips();
 
   @override
-  Widget build(BuildContext context) {
-    final visibleJobsAsync = ref.watch(visibleJobsProvider);
-    // Assignment 2.3, Part 9.1 — the offline flag drives the banner
-    // above the search field. Cold-boot behaviour explained in
-    // README 2.3, Q4: `isOfflineProvider` is `false` on the very
-    // first frame (the connectivity stream hasn't emitted yet) even
-    // when the device is actually offline, then flips to `true`
-    // within under a second when the first change event arrives.
-    final isOffline = ref.watch(isOfflineProvider);
+  Widget build(BuildContext context, WidgetRef ref) {
+    final selected = ref.watch(filterProvider);
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('CareerHub'),
-        centerTitle: false,
-        actions: [
-          const _SortButton(),
-          // Assignment 2.4, Part 9.3 — the logout action. The
-          // ORDER is deliberate (see README 2.4, Q4): every
-          // user-scoped data provider is invalidated FIRST so
-          // its in-flight work is torn down while the widget
-          // tree still exists, and only THEN is
-          // `authNotifier.logout()` called, which flips state
-          // to Unauthenticated and lets the router redirect to
-          // /login.
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Sign out',
-            onPressed: () {
-              ref.invalidate(jobsProvider);
-              // Stretch C — saved-jobs cache is user-scoped.
-              ref.invalidate(savedJobIdsProvider);
-              ref.read(authProvider.notifier).logout();
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          for (final option in _kFilterOptions) ...[
+            FilterChip(
+              label: Text(option.label),
+              selected: selected == option.value,
+              onSelected: (_) =>
+                  ref.read(filterProvider.notifier).select(option.value),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Part 3.3 + Part 4.1 — _JobList.
+//
+// Owns:
+//   - `ref.watch(filteredJobsProvider)` — the one subscription this
+//     class carries.
+//   - The complete `when()` block with all three arms.
+//   - The `RepaintBoundary` (Part 4.1) that wraps ONLY the ListView
+//     inside the data arm — not the whole when(), not the loading
+//     arm, not the error arm.
+//   - The top banners (offline / pending-drafts) rendered above the
+//     scroll view. Placing them here keeps `HomeScreen`'s body
+//     literal to the Part 3.4 checkpoint.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class _JobList extends ConsumerWidget {
+  const _JobList();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(filteredJobsProvider);
+
+    return Column(
+      children: [
+        const _TopBanners(),
+        Expanded(
+          child: async.when(
+            // Part 6.2 — the loading arm is now the shimmer skeleton.
+            loading: () => const JobsShimmer(),
+            error: (error, stackTrace) => _ErrorState(
+              onRetry: () => ref.read(jobsProvider.notifier).refresh(),
+            ),
+            data: (jobs) {
+              if (jobs.isEmpty) {
+                return const EmptyJobsWidget(
+                  icon: Icons.filter_alt_off_outlined,
+                  title: 'No jobs match your filter',
+                  message: 'Try a different filter chip.',
+                );
+              }
+              // Part 4.1 — RepaintBoundary wraps ONLY the ListView.
+              // Not the whole when(), not the empty state, not the
+              // loading or error arms. See README 3.1 Q2 on layer
+              // isolation.
+              return RepaintBoundary(
+                child: ListView.builder(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: jobs.length,
+                  itemBuilder: (context, index) {
+                    final job = jobs[index];
+                    return InkWell(
+                      onTap: () =>
+                          context.push(AppRoutes.jobDetail(job.id)),
+                      child: JobCard(job: job),
+                    );
+                  },
+                ),
+              );
             },
           ),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: Column(
-        children: [
-          // Part 9.1 — the offline banner. Rendered conditionally
-          // (not always-present with an animation) because a hidden
-          // banner should not consume vertical space above the list.
-          if (isOffline) const _OfflineBanner(),
-
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: TextField(
-              controller: _searchController,
-              onChanged: (value) =>
-                  ref.read(searchQueryProvider.notifier).state = value,
-              decoration: InputDecoration(
-                isDense: true,
-                hintText: 'Search job titles…',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _searchController.text.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        tooltip: 'Clear search',
-                        onPressed: () {
-                          _searchController.clear();
-                          ref.read(searchQueryProvider.notifier).state = '';
-                        },
-                      ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-            ),
-          ),
-
-          const _FilterDropdownRow(),
-
-          Expanded(
-            child: visibleJobsAsync.when(
-              loading: () => const Center(
-                child: CircularProgressIndicator(),
-              ),
-              error: (error, stackTrace) => _ErrorState(
-                onRetry: () =>
-                    ref.read(jobsProvider.notifier).refresh(),
-              ),
-              data: (jobs) {
-                if (jobs.isEmpty) {
-                  return const EmptyJobsWidget(
-                    icon: Icons.filter_alt_off_outlined,
-                    title: 'No jobs match your filters',
-                    message: 'Try a different filter or search term.',
-                  );
-                }
-
-                // Stretch A — pull-to-refresh. RefreshIndicator's
-                // Future determines how long the spinner stays on
-                // screen; JobsNotifier.refresh() awaits the fresh
-                // fetch, so the animation ends exactly when the new
-                // data (or an error) arrives. See README Stretch A.
-                return RefreshIndicator(
-                  onRefresh: () =>
-                      ref.read(jobsProvider.notifier).refresh(),
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      final width = constraints.maxWidth;
-
-                      if (width < _gridBreakpoint) {
-                        return ListView.builder(
-                          // A scrollable is required for RefreshIndicator
-                          // to receive drag events even when the list is
-                          // short; AlwaysScrollable makes a single-card
-                          // list still refreshable.
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemCount: jobs.length,
-                          itemBuilder: (context, index) =>
-                              _buildCard(context, index, jobs),
-                        );
-                      }
-
-                      final crossAxisCount =
-                          width >= _threeColumnBreakpoint ? 3 : 2;
-                      final childAspectRatio =
-                          width >= _threeColumnBreakpoint ? 1.05 : 1.2;
-
-                      return GridView.builder(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        padding: const EdgeInsets.all(8),
-                        gridDelegate:
-                            SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: crossAxisCount,
-                          crossAxisSpacing: 8,
-                          mainAxisSpacing: 8,
-                          childAspectRatio: childAspectRatio,
-                        ),
-                        itemCount: jobs.length,
-                        itemBuilder: (context, index) =>
-                            _buildCard(context, index, jobs),
-                      );
-                    },
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  static Widget _buildCard(BuildContext context, int index, List<Job> jobs) {
-    final job = jobs[index];
-    return InkWell(
-      onTap: () => context.push(AppRoutes.jobDetail(job.id)),
-      child: JobCard(job: job),
+        ),
+      ],
     );
   }
 }
 
-/// Assignment 2.3, Part 9.1 — the offline banner.
-///
-/// - background: `colorScheme.errorContainer`
-/// - foreground: `colorScheme.onErrorContainer`
-/// - icon: `Icons.cloud_off_outlined`
-/// - text: `cacheAgeProvider` (Stretch A) when available, otherwise
-///   the generic fallback "You're offline — showing cached jobs."
-///
-/// Appears and disappears automatically without any user interaction —
-/// the parent widget's `if (isOffline)` guard is the only visibility
-/// switch.
+// ═══════════════════════════════════════════════════════════════════════════
+// Top banners — offline + pending drafts (Stretch C).
+//
+// Two banners share a slot at the very top of the list area. Offline
+// takes precedence (it's the more urgent state); the drafts banner
+// shows only when the app is online and drafts remain undrained.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class _TopBanners extends ConsumerWidget {
+  const _TopBanners();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final isOffline = ref.watch(isOfflineProvider);
+    if (isOffline) return const _OfflineBanner();
+
+    // Stretch C — persistent banner while drafts remain in Isar.
+    final hasDrafts = ref.watch(hasPendingDraftsProvider);
+    if (hasDrafts) return const _PendingDraftsBanner();
+
+    return const SizedBox.shrink();
+  }
+}
+
 class _OfflineBanner extends ConsumerWidget {
   const _OfflineBanner();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
-    // Stretch A — the age string; `null` when the app has never had
-    // a successful network response. See README 2.3, Stretch A.
     final ageString = ref.watch(cacheAgeProvider);
     final message = ageString ?? "You're offline — showing cached jobs.";
 
@@ -256,27 +347,36 @@ class _OfflineBanner extends ConsumerWidget {
   }
 }
 
-/// Two side-by-side dropdown filters above the job list/grid.
-class _FilterDropdownRow extends StatelessWidget {
-  const _FilterDropdownRow();
+/// Assignment 3.1 Stretch C — the persistent "drafts pending" banner.
+class _PendingDraftsBanner extends ConsumerWidget {
+  const _PendingDraftsBanner();
 
   @override
-  Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+  Widget build(BuildContext context, WidgetRef ref) {
+    final scheme = Theme.of(context).colorScheme;
+    final count = ref.watch(pendingDraftsCountProvider);
+
+    return Container(
+      width: double.infinity,
+      color: scheme.tertiaryContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       child: Row(
         children: [
-          Expanded(
-            child: _FilterField(
-              label: 'Location',
-              child: _LocationFilterDropdown(),
-            ),
+          Icon(
+            Icons.upload_file_outlined,
+            color: scheme.onTertiaryContainer,
+            size: 20,
           ),
-          SizedBox(width: 12),
+          const SizedBox(width: 12),
           Expanded(
-            child: _FilterField(
-              label: 'Job type',
-              child: _JobTypeFilterDropdown(),
+            child: Text(
+              count == 1
+                  ? 'You have 1 application draft waiting to sync.'
+                  : 'You have $count application drafts waiting to sync.',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: scheme.onTertiaryContainer,
+                    fontWeight: FontWeight.w500,
+                  ),
             ),
           ),
         ],
@@ -285,176 +385,83 @@ class _FilterDropdownRow extends StatelessWidget {
   }
 }
 
-class _FilterField extends StatelessWidget {
-  final String label;
-  final Widget child;
+// ═══════════════════════════════════════════════════════════════════════════
+// Search delegate — invoked from the AppBar search action.
+// ═══════════════════════════════════════════════════════════════════════════
 
-  const _FilterField({required this.label, required this.child});
-
+class _JobSearchDelegate extends SearchDelegate<String> {
   @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label,
-          style: theme.textTheme.labelSmall?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-            fontWeight: FontWeight.w600,
+  List<Widget>? buildActions(BuildContext context) => [
+        if (query.isNotEmpty)
+          IconButton(
+            icon: const Icon(Icons.clear),
+            tooltip: 'Clear',
+            onPressed: () => query = '',
           ),
-        ),
-        const SizedBox(height: 4),
-        child,
-      ],
-    );
-  }
-}
-
-/// Assignment 2.3, Part 7 (Step 7.3) — the Location dropdown now reads
-/// the persisted `filterProvider` (String) and writes via
-/// `.select(String)` so the selection survives force-close.
-///
-/// The dropdown items are `LocationType?` values (unchanged from 2.2);
-/// two small conversions bridge to the String world:
-///   - read:  `_dropdownValueFromFilter(String)` → `LocationType?`
-///   - write: `_filterFromDropdownValue(LocationType?)` → `String`
-///
-/// The dropdown items themselves are unchanged; the filter predicate
-/// in `filteredJobsProvider` uses the same String conversion.
-class _LocationFilterDropdown extends ConsumerWidget {
-  const _LocationFilterDropdown();
+      ];
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    // Part 7 — a subscription: rebuild whenever the persisted filter
-    // changes (e.g. on cold boot after `build()` reads the stored
-    // value). See README 2.3, Part 7.
-    final filter = ref.watch(filterProvider);
-    final selected = _dropdownValueFromFilter(filter);
-
-    return DropdownButtonFormField<LocationType?>(
-      initialValue: selected,
-      isExpanded: true,
-      isDense: true,
-      decoration: InputDecoration(
-        isDense: true,
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
-      ),
-      items: const [
-        DropdownMenuItem<LocationType?>(
-          value: null,
-          child: Text('All locations'),
-        ),
-        DropdownMenuItem<LocationType?>(
-          value: LocationType.onSite,
-          child: Text('On-site'),
-        ),
-        DropdownMenuItem<LocationType?>(
-          value: LocationType.remote,
-          child: Text('Remote'),
-        ),
-        DropdownMenuItem<LocationType?>(
-          value: LocationType.hybrid,
-          child: Text('Hybrid'),
-        ),
-      ],
-      // Part 7 — a mutation. `ref.read` inside `onChanged` matches the
-      // widget-level `watch`-vs-`read` rule from Assignment 1.3 Q1.
-      // `.notifier` resolves to the `FilterNotifier` instance so we
-      // can call `.select(...)`, which handles both the
-      // SharedPreferences write and the state update.
-      onChanged: (value) => ref
-          .read(filterProvider.notifier)
-          .select(_filterFromDropdownValue(value)),
-    );
-  }
-
-  static LocationType? _dropdownValueFromFilter(String filter) {
-    if (filter == kFilterAll) return null;
-    for (final value in LocationType.values) {
-      if (value.name == filter) return value;
-    }
-    return null;
-  }
-
-  static String _filterFromDropdownValue(LocationType? value) {
-    return value?.name ?? kFilterAll;
-  }
-}
-
-class _JobTypeFilterDropdown extends ConsumerWidget {
-  const _JobTypeFilterDropdown();
+  Widget? buildLeading(BuildContext context) => IconButton(
+        icon: const Icon(Icons.arrow_back),
+        tooltip: 'Back',
+        onPressed: () => close(context, ''),
+      );
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final selected = ref.watch(jobTypeFilterProvider);
+  Widget buildResults(BuildContext context) => _buildResults();
 
-    return DropdownButtonFormField<JobTypeFilter?>(
-      initialValue: selected,
-      isExpanded: true,
-      isDense: true,
-      decoration: InputDecoration(
-        isDense: true,
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
-      ),
-      items: [
-        const DropdownMenuItem<JobTypeFilter?>(
-          value: null,
-          child: Text('All types'),
-        ),
-        for (final type in JobTypeFilter.values)
-          DropdownMenuItem<JobTypeFilter?>(
-            value: type,
-            child: Text(type.label),
+  @override
+  Widget buildSuggestions(BuildContext context) => _buildResults();
+
+  Widget _buildResults() {
+    return Consumer(
+      builder: (context, ref, _) {
+        final async = ref.watch(jobsProvider);
+        return async.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (_, __) => const Center(
+            child: Text("Couldn't load jobs. Please try again."),
           ),
-      ],
-      onChanged: (value) =>
-          ref.read(jobTypeFilterProvider.notifier).state = value,
+          data: (List<Job> jobs) {
+            final q = query.trim();
+            final filtered =
+                q.isEmpty ? jobs : jobs.where((j) => j.matches(q)).toList();
+            if (filtered.isEmpty) {
+              return const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(32),
+                  child: Text(
+                    'No matching jobs.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              );
+            }
+            return ListView.builder(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              itemCount: filtered.length,
+              itemBuilder: (context, index) {
+                final job = filtered[index];
+                return InkWell(
+                  onTap: () {
+                    close(context, '');
+                    context.push(AppRoutes.jobDetail(job.id));
+                  },
+                  child: JobCard(job: job),
+                );
+              },
+            );
+          },
+        );
+      },
     );
   }
 }
 
-class _SortButton extends ConsumerWidget {
-  const _SortButton();
+// ═══════════════════════════════════════════════════════════════════════════
+// Error state — retained from Assignment 2.3.
+// ═══════════════════════════════════════════════════════════════════════════
 
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final sortOrder = ref.watch(sortOrderProvider);
-
-    return PopupMenuButton<SortOrder>(
-      icon: const Icon(Icons.sort_by_alpha),
-      tooltip: 'Sort by title',
-      onSelected: (value) =>
-          ref.read(sortOrderProvider.notifier).state = value,
-      itemBuilder: (context) => [
-        CheckedPopupMenuItem(
-          value: SortOrder.aToZ,
-          checked: sortOrder == SortOrder.aToZ,
-          child: const Text('Title: A–Z'),
-        ),
-        CheckedPopupMenuItem(
-          value: SortOrder.zToA,
-          checked: sortOrder == SortOrder.zToA,
-          child: const Text('Title: Z–A'),
-        ),
-      ],
-    );
-  }
-}
-
-/// Shown when visibleJobsProvider's AsyncValue is in the error state.
-/// Deliberately generic and friendly — CareerHub never surfaces a raw
-/// exception string to a job seeker.
 class _ErrorState extends StatelessWidget {
   final VoidCallback onRetry;
 

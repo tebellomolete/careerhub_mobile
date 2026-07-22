@@ -5,6 +5,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import '../models/auth_state.dart';
 import '../providers/auth_notifier.dart';
 import '../providers/auth_provider.dart';
+import '../screens/apply_screen.dart';
 import '../screens/home_screen.dart';
 import '../screens/job_detail_screen.dart';
 import '../screens/login_screen.dart';
@@ -116,6 +117,22 @@ GoRouter appRouter(Ref ref) {
                         jobId: (rawId == null || rawId.isEmpty) ? null : rawId,
                       );
                     },
+                    routes: [
+                      // Assignment 3.1, Part 7.1 — the apply
+                      // sub-route. Full path `/jobs/:id/apply`.
+                      // The literal segment `apply` does not
+                      // conflict with the parameterised `:id`
+                      // above because `apply` is matched at a
+                      // deeper level (as a child of `:id`), not
+                      // as a sibling at the same level.
+                      GoRoute(
+                        path: 'apply',
+                        builder: (context, state) {
+                          final id = state.pathParameters['id']!;
+                          return ApplyScreen(jobId: id);
+                        },
+                      ),
+                    ],
                   ),
                 ],
               ),

@@ -1,55 +1,45 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../models/auth_state.dart';
 import '../providers/auth_notifier.dart';
 
-// Assignment 2.4, Part 8.2 — the login screen.
-//
-// Full-screen `Scaffold` with no `AppBar`, sits OUTSIDE the
-// StatefulShellRoute so it has no NavigationBar. `_submit()`
-// calls `authProvider.notifier.login(...)` — it never
-// calls `context.go()`. The router's redirect callback drives
-// the transition to `/jobs` the moment the notifier's state
-// flips to `AuthData(Authenticated(...))`.
-//
-// The layout uses Dart 3 pattern matching (`case AuthError(...)`)
-// to extract the error string in one place — exactly the shape
-// the assignment's Part 8 checkpoint requires.
-class LoginScreen extends ConsumerStatefulWidget {
+/// Assignment 3.1, Part 5 — LoginScreen as a HookConsumerWidget.
+///
+/// **What changed vs Assignment 2.4.**
+///   - The class hierarchy collapsed from `ConsumerStatefulWidget` +
+///     `ConsumerState` down to a single class extending
+///     `HookConsumerWidget`. `createState()`, the entire `_LoginScreenState`
+///     subclass, the `TextEditingController` field declarations, the
+///     `initState`/`dispose` overrides, and the `_submit()` instance
+///     method are all gone.
+///   - Both controllers are now returned by `useTextEditingController()`
+///     — the hooks framework's `HookState.dispose()` runs the
+///     controller's `dispose()` automatically when the element
+///     unmounts (see README 3.1 Q3 on the disposal guarantee).
+///   - `submit` is a **local function inside `build()`**. It closes
+///     over the two controller locals, so it takes no parameters.
+///
+/// **Import change.** This file imports `hooks_riverpod` and
+/// `flutter_hooks` instead of `flutter_riverpod`. `hooks_riverpod`
+/// re-exports the entire Riverpod 3 API surface — `ProviderScope`,
+/// `ConsumerWidget`, `WidgetRef`, `ref.watch/read/listen` — so no
+/// other file that continues to use `ConsumerWidget` needs to change.
+/// Both packages run against the same `ProviderScope` in `main.dart`.
+class LoginScreen extends HookConsumerWidget {
   const LoginScreen({super.key});
 
   @override
-  ConsumerState<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends ConsumerState<LoginScreen> {
-  late final TextEditingController _emailController;
-  late final TextEditingController _passwordController;
-
-  @override
-  void initState() {
-    super.initState();
-    _emailController = TextEditingController();
-    _passwordController = TextEditingController();
-  }
-
-  @override
-  void dispose() {
-    _emailController.dispose();
-    _passwordController.dispose();
-    super.dispose();
-  }
-
-  void _submit() {
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
-    ref.read(authProvider.notifier).login(email, password);
-  }
-
-  @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
+
+    // Hooks — order matters. Both allocated on first build, returned
+    // as the same instances on every subsequent build. Disposed by
+    // the hook framework on unmount — no manual dispose here.
+    final emailController = useTextEditingController();
+    final passwordController = useTextEditingController();
+
     final auth = ref.watch(authProvider);
 
     // Derive two view-model values from the watched AsyncValue.
@@ -57,17 +47,26 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     // (the login mutator sets that BEFORE any await, so we
     // don't need to consult `auth.isLoading` — that would only
     // be true during cold-boot build()).
-    // Riverpod 3 renamed `valueOrNull` → `value` (null-safe by default).
     final resolved = auth.value;
     final bool loading = resolved is Authenticating;
 
-    // Pattern-match on the AuthError variant to extract the
-    // message. `null` in every other case; the widget below
-    // treats `null` as "no error to show".
+    // Pattern-match on the AuthError variant to extract the message.
+    // `null` in every other case; the widget below treats `null` as
+    // "no error to show".
     final String? errorMessage = switch (resolved) {
       AuthError(:final message) => message,
       _ => null,
     };
+
+    // Local closure — captures the controller locals from the enclosing
+    // `build()` call frame, so it needs no parameters. Called by the
+    // password field's `onSubmitted` and the Sign-in button's
+    // `onPressed`.
+    void submit() {
+      final email = emailController.text.trim();
+      final password = passwordController.text;
+      ref.read(authProvider.notifier).login(email, password);
+    }
 
     return Scaffold(
       body: SafeArea(
@@ -102,7 +101,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                 ),
                 const SizedBox(height: 32),
                 TextField(
-                  controller: _emailController,
+                  controller: emailController,
                   keyboardType: TextInputType.emailAddress,
                   textInputAction: TextInputAction.next,
                   autocorrect: false,
@@ -115,10 +114,10 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                 ),
                 const SizedBox(height: 12),
                 TextField(
-                  controller: _passwordController,
+                  controller: passwordController,
                   obscureText: true,
                   textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => loading ? null : _submit(),
+                  onSubmitted: (_) => loading ? null : submit(),
                   decoration: const InputDecoration(
                     labelText: 'Password',
                     prefixIcon: Icon(Icons.lock_outline),
@@ -138,7 +137,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                 ],
                 const SizedBox(height: 24),
                 FilledButton(
-                  onPressed: loading ? null : _submit,
+                  onPressed: loading ? null : submit,
                   child: loading
                       ? const SizedBox(
                           width: 20,

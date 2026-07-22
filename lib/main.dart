@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/isar_provider.dart';
 import 'core/prefs_provider.dart';
+import 'data/application_draft.dart';
 import 'data/job_cache.dart';
 import 'data/saved_job_cache.dart';
 import 'providers/pending_sync_service.dart';
@@ -31,7 +32,11 @@ Future<void> main() async {
   final isar = await Isar.open(
     // Assignment 2.4 Stretch C — SavedJobCacheSchema is emitted
     // by isar_community_generator into lib/data/saved_job_cache.g.dart.
-    [JobCacheSchema, SavedJobCacheSchema],
+    // Assignment 3.1 Stretch C — ApplicationDraftSchema is emitted
+    // into lib/data/application_draft.g.dart. Add it to the open
+    // list so the offline application-draft queue is available at
+    // cold boot.
+    [JobCacheSchema, SavedJobCacheSchema, ApplicationDraftSchema],
     directory: dir.path,
   );
 

@@ -27,7 +27,7 @@ android {
         // 21/22 compiles and installs cleanly, then throws
         // `NoSuchAlgorithmException` the first time secure-storage
         // is touched at runtime. See README 2.4, Q1 (third bullet).
-        minSdk = 23
+        minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

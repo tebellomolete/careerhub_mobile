@@ -1,3 +1,609 @@
+# CareerHub — Assignment 3.1: Advanced UI Patterns & Performance
+
+_Written 2026-07-22._
+
+Week 3, Assignment 3.1. This section contains the four Part 1 written
+decisions (three-tree model & rebuild scope; `const` short-circuit &
+`RepaintBoundary`; hooks model & controller lifecycle; FormBuilder state
+& cross-field validation); the baseline and after rebuild-count tables;
+the shimmer, application-form, and DevTools-scroll-frame demo
+write-ups; the `build_runner` note; the `flutter test` slot; and the
+three stretch goals (A: two-step application form; B: animated field
+reveal; C: offline application drafts). Earlier assignment notes are
+preserved further down as historical context.
+
+---
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — The three-tree model and rebuild scope
+
+**Element reuse when `runtimeType` and `key` match.** When a parent
+widget rebuilds and produces a new child widget instance whose
+`runtimeType` and `key` match the child already mounted at that slot,
+Flutter's `Element.update` path is taken rather than
+`Element.inflateWidget`. The existing Element stays in place, its
+`_widget` field is repointed at the new widget instance, and its
+`RenderObject` is preserved by reference. The framework then calls
+`RenderObject.updateWith(new widget)`, which — for most render objects
+— compares each configurable property and only marks the render object
+for layout (`markNeedsLayout`) or paint (`markNeedsPaint`) if a
+property actually changed. If the new widget carries the same values,
+the render object is neither re-laid-out nor re-painted; the frame
+reuses the previous layout and raster output. Contrast with a new
+widget of a **different** `runtimeType`: `Element.update` returns
+`false` in `Widget.canUpdate`, the old element is unmounted (its
+`RenderObject` detached and disposed), and `inflateWidget` builds a
+new element which allocates and attaches a **new** `RenderObject`,
+forcing a fresh layout and paint from scratch.
+
+**Per-widget cost of unnecessary widget construction on our jobs
+screen.** Today (before Part 3) the jobs screen is a single
+`ConsumerWidget` whose `build()` calls
+`ref.watch(filteredJobsProvider)` and `ref.watch(filterProvider)`. On
+a filter chip tap both providers emit, so the whole method reruns.
+Every widget the method mentions is **allocated fresh**: `Scaffold`,
+`AppBar`, its `Text('CareerHub')`, the actions list literal, the
+`IconButton` for logout, `Padding` wrappers, the `Column`, the
+horizontally scrollable `Row` of `FilterChip`s (four allocations plus
+the `Row` and the `SingleChildScrollView`), the `Expanded` around the
+list, the `when()` arms (two closures + the `AsyncValue` case
+tables), and — inside the data arm — every visible `JobCard` widget
+constructor call. Each allocation runs the constructor body, walks
+its parameters, and produces a new instance in the heap. Even though
+the element tree calls `Widget.canUpdate` next and discovers the
+`runtimeType` and `key` haven't changed (so the `RenderObject` is
+reused), we still paid: (a) the constructor allocation, (b) the
+walk-and-compare in `Element.update`, (c) the property-by-property
+diff in `RenderObject.updateWith`. Multiplied by ~30 widgets per
+`JobCard` × N visible cards, a filter chip tap that changes *no card
+data* still charges tens of thousands of unnecessary allocations and
+comparisons per frame.
+
+**The `const` short-circuit.** After Part 3, the screen's `build()`
+watches nothing; its body is literally
+`const Column(children: [_FilterChips(), Expanded(child: _JobList())])`.
+Because `_FilterChips()` and `_JobList()` both have `const`
+constructors and no runtime arguments, Dart evaluates them at compile
+time and **canonicalises** them: every rebuild of the screen produces
+the exact same object instance for the `Column`, its two children,
+and the `EdgeInsets`/`SizedBox`/`Text` constants inside. When
+`Element.update` runs on a const-canonicalised child, Flutter's short
+path in the diff is `identical(oldWidget, newWidget)` — a pointer
+compare. On success the framework **skips the entire subtree diff**:
+no `Element.update` recursion, no `RenderObject.updateWith`, no
+property compare. The element tree is walked *past* the const
+subtree, treating it as a black box that provably cannot have changed.
+The screen class itself no longer subscribes to any provider, so a
+filter chip tap doesn't invoke its `build()` at all; the child
+`_FilterChips` — which does subscribe — is the only widget whose
+`build()` reruns.
+
+### Question 2 — `const` short-circuit and `RepaintBoundary` layer isolation
+
+**What the element tree does when it re-sees a `const` child it has
+already mounted.** Dart evaluates `const` constructor calls at compile
+time and canonicalises the results: `const _JobList()` at line 42 of
+one build and `const _JobList()` at line 42 of the next build are
+guaranteed to be the *same object* — literally the same pointer,
+detected by `identical(a, b)` returning `true`. When a parent rebuilds
+and hands its element the same const child instance, the element's
+diffing step performs an `identical(oldWidget, newWidget)` check at
+the very top of `Element.update`. It returns immediately with no
+`build()` call on the child, no `RenderObject.updateWith`, no property
+diff, and no layout or paint dirtying. The framework treats the
+subtree as provably unchanged and moves on. The cost of "diffing" a
+const subtree of arbitrary depth is therefore a single pointer
+compare — the same as the cost of diffing a leaf that turned out to
+match.
+
+**`RepaintBoundary` layer isolation during scroll.** A `RenderObject`
+without a repaint boundary is painted into its nearest ancestor's
+compositing layer. When any descendant needs a repaint — a scrolling
+list constantly translates and paints its children — the whole layer
+is re-rasterised on the GPU. Wrapping the list in `RepaintBoundary`
+inserts a **new compositing layer** in the render tree at that point:
+Skia allocates a dedicated **raster cache texture** (an RGBA
+GPU-resident bitmap, sized to the widget's paint bounds), the list's
+own paints render into that texture, and everything ABOVE the boundary
+(AppBar, filter chip row) paints into a separate layer. During a
+scroll the two layers are simply re-composed by the GPU with a
+translate transform — the top layer's texture is **not re-rasterised**
+because none of the widgets that render into it changed. The Flutter
+mechanism that avoids the re-raster is the compositor's **layer
+caching / repaint-region tracking**: each `RepaintBoundary` produces
+an `OffsetLayer` whose bitmap is retained frame-to-frame and reused
+whenever its `RenderObject` is not marked dirty. The memory cost per
+boundary is exactly the size of that raster texture — width × height ×
+4 bytes at device pixel ratio — sitting in GPU memory for the lifetime
+of the layer.
+
+**Two scenarios where adding a `RepaintBoundary` would be wrong.**
+_(a) A `RepaintBoundary` around a widget that repaints on every
+frame._ Consider a `RepaintBoundary` around an `AnimatedBuilder`
+driven by a `Ticker` — say a spinning refresh icon. Because the child
+widget changes every frame, its raster cache is invalidated every
+frame, so the GPU texture must be **re-rasterised on every tick**.
+The boundary now costs (i) a texture allocation, (ii) an extra
+composition step to merge the layer with its parent, and (iii) the
+same paint work that would have happened anyway. Net effect: strictly
+slower than the no-boundary baseline. _(b) A `RepaintBoundary` around
+a trivially cheap leaf._ Wrapping a single `Icon` with no siblings
+that repaint costs a raster texture (~a few KB of GPU memory) to
+cache a paint that would have taken well under a microsecond. The
+boundary imposes memory pressure and an extra composition merge with
+no observable saving.
+
+### Question 3 — The hooks model and controller lifecycle
+
+**Hooks are stored in a numerically indexed list.** When
+`HookConsumerWidget.build()` runs, `HookState` (attached to the
+element) holds a `List<HookState>` and an integer cursor. Each call
+to `useSomething()` either reads position `cursor++` if a hook of the
+matching type exists there, or creates a new one and pushes it. The
+identity of a hook is therefore its **position in the list**, not its
+name. The rule is: hooks must be called **unconditionally, in the
+same order, on every build**. Wrapping a `useTextEditingController()`
+call in `if (someCondition) { ... }` breaks that rule the first time
+the condition flips. Concretely: the first build ran
+`useTextEditingController()` at cursor position 3, so
+`_hooks[3] = HookState<TextEditingController>`. If the next build
+skips that hook and instead the next call is `useState<int>(0)`, the
+framework advances the cursor to 3, sees the pre-existing
+`HookState<TextEditingController>` at that index, and returns it. The
+build code cast it to `ValueNotifier<int>` and either (i) throws a
+`TypeError` at the assignment site (`type 'TextEditingController' is
+not a subtype of 'ValueNotifier<int>'`), (ii) succeeds silently and
+mutates the wrong controller — the "stale controller reused" case
+that reads text from a field that no longer exists on screen. The
+user experiences a crash or, worse, edits that vanish; either way
+the diagnostic points at the wrong line.
+
+**Field-declared `TextEditingController` leak vs
+`useTextEditingController()`'s guarantee.** In a `StatefulWidget`,
+declaring `final TextEditingController _emailController =
+TextEditingController();` (or `late final` initialised in
+`initState`) allocates a controller that internally attaches
+listeners and holds a `ChangeNotifier`'s subscribers list. If the
+developer forgets to override `dispose()` and call
+`_emailController.dispose()`, the controller — and every listener the
+framework attached to it (the `TextField` internally listens to it)
+— is retained after the State is unmounted, indefinitely, because the
+`_State` object still holds a reference and the widget tree drops the
+State without teardown. Every navigation to and away from that screen
+adds another orphan controller, a classic slow leak that grows the
+retained heap until an OOM. `useTextEditingController()` sidesteps
+this: internally it creates a `_TextEditingControllerHookState`, and
+the piece of the framework responsible for the disposal guarantee is
+**`HookState.dispose()`** — called by `HookElement` when the hook is
+removed from the hook list or the entire element is unmounted. In
+`_TextEditingControllerHookState.dispose()`, the controller's
+`dispose()` is invoked automatically. The user cannot forget because
+the user never wrote a dispose method in the first place — the hook
+owns the lifecycle.
+
+**Why the `GlobalKey<FormBuilderState>` MUST come from
+`useMemoized(() => GlobalKey<FormBuilderState>())` rather than a
+plain local variable.** A plain local `final formKey =
+GlobalKey<FormBuilderState>()` inside `build()` would allocate a
+**brand new `GlobalKey` on every rebuild**. `GlobalKey` carries an
+invariant enforced by the framework: for any given
+`GlobalKey`, at most one Element in the tree may be registered against
+it. When the parent rebuilds and produces `FormBuilder(key:
+newKey, ...)`, the element diff sees that the widget's key changed
+from `oldKey` to `newKey`. The framework's rule is that a widget with
+a **new key** cannot update the existing element — it must be
+**re-mounted** at a fresh Element. So on every rebuild: the old
+`FormBuilder` Element is detached, its `FormBuilderState` is disposed
+(losing every field's controller value, every `saveAndValidate`
+result, every focus state), and a new `FormBuilder` Element is
+inflated with an empty `FormBuilderState`. User-visible symptom: any
+keystroke — since typing rebuilds the ancestor via a hook or the
+provider it watches — clears the form. `useMemoized(() =>
+GlobalKey<FormBuilderState>())` fixes this by returning the **same
+key instance** on every build (the memoized value is computed once at
+first build and stored in the hook list), so `FormBuilder(key:
+formKey)` receives the same key across rebuilds and its Element is
+never re-mounted.
+
+### Question 4 — FormBuilder state and cross-field validation
+
+**Why `saveAndValidate()` calls `save()` before `validate()`.** Each
+`FormBuilderField`'s currently displayed value is held in the field's
+own `FormBuilderFieldState`, populated by its internal
+`TextEditingController` (for text fields) or its `onChanged`
+callbacks (for pickers, checkboxes). `FormBuilderState.value` is the
+centralised `Map<String, dynamic>` of all field values keyed by
+`name`. `save()` walks every registered field and copies each
+field's current controller value into `FormBuilderState.value`. Only
+after that walk does `validate()` run each field's validator — but
+critically, cross-field validators (e.g. "must be after the value in
+field X") read `formKey.currentState!.value` to look sideways at
+sibling fields. If `validate()` ran before `save()`, the map would
+still hold the values from the **previous** `save()` call (or empty
+on first submit), and a validator comparing "start date" to
+"DateTime.now()" would work (it reads a global), but any validator
+that read another field's value would see stale data. For the start
+date field's own validator (which reads only its argument, not the
+map), the order does not matter functionally — but a validator that
+happened to cross-reference another field would silently pass or
+fail on a stale reading if we called `validate()` first.
+
+**Why `FormBuilderValidators.required()` must be first in every
+composed list.** `FormBuilderValidators.compose([a, b, c])` runs the
+validators **in declaration order**, stopping at the first that
+returns a non-null error string. If we compose `[minLength(50),
+required()]` on the cover-letter field and the user submits it blank,
+`minLength(50)` runs first, sees an empty string, computes
+`0 < 50`, and returns `'Value must be at least 50 characters
+long.'`. The user reads that and is told to write more, but the
+actual problem is "you wrote nothing." Placing `required()` first
+short-circuits the moment the field is empty and produces the
+correct diagnostic `'This field is required.'`. Every downstream
+validator (`minLength`, `email`, `url`, custom) then only runs when
+we already know the field is non-empty and can assume so.
+
+**Portfolio URL — three-case validator (pseudocode).**
+
+```
+String? validatePortfolio(String? value) {
+  // Case 1: field left blank — allowed.
+  if (value == null || value.isEmpty) return null;
+
+  // Case 2 & 3: field non-empty — delegate to url().
+  //   - well-formed URL → url() returns null (valid).
+  //   - garbage string  → url() returns 'Not a valid URL' (invalid).
+  return FormBuilderValidators.url()(value);
+}
+```
+
+Wrapping this in `FormBuilderValidators.required()` first would flip
+Case 1 from "valid" to "This field is required." Wrapping only
+`FormBuilderValidators.url()` (no empty guard) would flip Case 1 from
+"valid" to `'Not a valid URL'` — the URL validator does not treat an
+empty string as vacuously valid; it treats it as malformed. Both
+alternatives break the "optional field" contract, which is why the
+hand-written guard is necessary.
+
+---
+
+## Baseline rebuild counts
+
+Recorded via Flutter DevTools → Widget Rebuild Stats, before Part 3.
+Reset the counter, then tap the location filter chip three times
+alternating with **All**. Fill in the numbers observed on your
+machine:
+
+| Widget                  | Rebuilds per 3 filter taps |
+| ----------------------- | -------------------------- |
+| `HomeScreen` (screen)   | _TODO — measure_           |
+| `JobCard` (per visible) | _TODO — measure_           |
+
+---
+
+## PART 6 — Shimmer demo
+
+The `JobsShimmer` widget replaces the loading arm of the jobs list
+`when()`. It shows six `_ShimmerCard` items in a `ListView.builder`,
+each a `Card` with padding that structurally mirrors a real
+`JobCard`: a 16-high title bar (~200 wide), a shorter company line
+(~120 wide) and location/salary line (~160 wide), then a row of two
+28-high rounded chip-shaped `Container`s. All Containers are
+`Colors.white`, painted through a `Shimmer.fromColors` `ShaderMask`
+whose `baseColor` / `highlightColor` come from
+`Theme.of(context).brightness`:
+
+- **Light mode:** `Colors.grey[300]!` / `Colors.grey[100]!`.
+- **Dark mode:** `Colors.grey[700]!` / `Colors.grey[600]!`.
+
+The shimmer's structural layout does not depend on the brightness —
+only the two grey shades that sweep across the mask change. Confirm
+by toggling the emulator between light and dark (Android:
+`adb shell "cmd uimode night yes/no"`, or Settings → Display →
+Dark theme) while the shimmer is on screen; the base and highlight
+tones swap and everything else stays identical.
+
+Dark-mode confirmed: _TODO — check off after seeing it live_.
+
+---
+
+## PART 7 — Application form demo
+
+The **Apply for this job** button on the job detail screen pushes
+`/jobs/<id>/apply`, mounting `ApplyScreen(jobId: id)`. The form is a
+two-step `FormBuilder` (Stretch A) using
+`useMemoized(() => GlobalKey<FormBuilderState>())` for each step.
+
+**Navigation.** Sign in → tap any job card → tap **Apply for this
+job** → the apply screen slides in. Step 1 collects personal details
+(full name, email, years of experience, earliest start date). Tapping
+**Next** validates step 1 and advances to step 2 (cover letter,
+portfolio URL, terms). Tapping **Back** returns to step 1 with every
+field's value preserved (the step-1 `FormBuilder` is remounted from
+its cached `initialValue`s).
+
+**Blank-submit validation errors observed.** Tapping **Next** on a
+freshly-mounted step 1:
+
+- Full name: _'This field is required.'_
+- Email: _'This field is required.'_
+- Years of experience: _'This field is required.'_
+- Earliest start date: _'This field is required.'_
+
+Advancing (with valid step 1) and tapping **Submit** on blank step 2:
+
+- Cover letter: _'This field is required.'_
+- Terms confirmation: _'You must confirm your application is
+  accurate and complete.'_
+- Portfolio URL: no error (correctly optional).
+
+Entering a non-URL string like `not a url` into the portfolio field
+then submitting: _'This field is not a valid URL address.'_. Clearing
+it: valid again (three-case validator behaviour from Q4).
+
+**Success SnackBar.** With all fields valid and connectivity on:
+`'Application submitted!'`, then `Navigator.of(context).pop()`
+returns to the job detail screen.
+
+---
+
+## PART 8 — After rebuild counts
+
+Recorded via Flutter DevTools → Widget Rebuild Stats, after Part 8,
+running with:
+
+```bash
+flutter run --profile --dart-define=API_BASE_URL=http://10.0.2.2:5247
+```
+
+Reset the counter, then tap the location filter chip three times
+alternating with **All**. Fill in your numbers below.
+
+| Widget         | Before (Part 3) | After (Part 8) |
+| -------------- | --------------- | -------------- |
+| `HomeScreen`   | _TODO_          | _TODO — expect 0_  |
+| `_FilterChips` | _n/a — did not exist_ | _TODO — expect 3_ |
+| `_JobList`     | _n/a — did not exist_ | _TODO — expect 3_ |
+| `JobCard`      | _TODO_          | _TODO — expect 0_  |
+
+**Why `JobCard`'s after count is zero.** After the refactor, the
+`_JobList` widget rebuilds when `filteredJobsProvider` emits — but
+the provider emits **the same `List<Job>` instance** for a
+location-filter tap that doesn't add or remove jobs (the derived
+provider returns a new filtered list only when the filter predicate
+changes the result). Even when the list identity changes, each
+`JobCard` is constructed with the same `job: job` argument — the
+same `Job` instance from the same `List<Job>` — so `Widget.canUpdate`
+compares the old and new `JobCard` widgets, finds the same
+`runtimeType` and same `key`, calls `updateRenderObject` on the
+underlying render object, and detects no visual change. But
+`JobCard`'s ancestor is the `RepaintBoundary`-wrapped `ListView`;
+the boundary further ensures no repaint escapes to the AppBar or
+filter row. The DevTools Widget Rebuild counter counts
+**Element.rebuild** calls; a `JobCard` whose incoming widget
+identity is unchanged does not rebuild.
+
+## DevTools scroll-frame observation
+
+Open the Performance tab, tap Record, scroll the jobs list for
+three seconds, tap Stop, tap a frame bar. In the widget build
+timeline for that frame we expect to see:
+
+- _TODO — observe the build methods that appear during scroll_.
+
+We expect **not** to see `JobCard.build()` during a scroll that
+doesn't change the underlying data — the list widgets scroll via
+`RenderSliverList.performLayout` translations, and the
+`RepaintBoundary` prevents a paint from bubbling to ancestors. The
+`Scrollable` and its inner viewport widgets do appear because they
+are the ones driving the scroll offset.
+
+---
+
+## build_runner note
+
+**Was `build_runner` required for any file in Assignment 3.1?**
+
+- **Base parts 1–8:** No. `flutter_hooks`, `hooks_riverpod`,
+  `shimmer`, `flutter_form_builder`, and `form_builder_validators` do
+  not participate in code generation at all — they are pure runtime
+  packages that expose regular Dart classes (`HookConsumerWidget`,
+  `Shimmer`, `FormBuilder`, `FormBuilderValidators`). No new
+  `@riverpod`, `@freezed`, `@JsonSerializable`, or `@collection`
+  annotations are introduced anywhere in `lib/screens/*.dart` or
+  `lib/widgets/*.dart`. Every `*.g.dart` and `*.freezed.dart` file in
+  the tree today was generated in an earlier assignment and is
+  unmodified by 3.1.
+
+- **Stretch C:** Yes — one file. The new `lib/data/application_draft.dart`
+  declares `@collection class ApplicationDraft`, which
+  `isar_community_generator` reads to emit `application_draft.g.dart`
+  (the schema descriptor + typed query API + native codecs). Run
+  `dart run build_runner build --delete-conflicting-outputs` once
+  after `flutter pub get` to produce it. The generator is already in
+  `dev_dependencies` from Assignment 2.3; no new dev dep is needed.
+
+---
+
+## flutter test
+
+_TODO — paste the terminal output from `flutter test` here after the
+manual steps below are complete._
+
+```
+[paste output of: flutter test]
+```
+
+---
+
+## STRETCH A — Multi-step application form
+
+`ApplyScreen` is a two-step form. Step 1 collects the four personal
+details (full name, email, years of experience, earliest start
+date); step 2 collects the two application-content fields (cover
+letter, portfolio URL) and the terms confirmation checkbox. Each
+step has its **own `FormBuilder` widget with its own
+`GlobalKey<FormBuilderState>`** — both keys created with
+`useMemoized(() => GlobalKey<FormBuilderState>())` so the memoised
+key survives rebuilds (see Q3). A **Next** button advances from step
+1 to step 2 only after step 1's `saveAndValidate()` returns `true`.
+A **Back** button returns to step 1 with all its field values
+preserved by re-passing them as `initialValue` on remount.
+
+**Why two `FormBuilder`s (each with its own `GlobalKey`) is
+preferable to one `FormBuilder` with fields hidden using
+`Visibility` or `Offstage`.** Hiding fields via `Visibility(visible:
+false, child: ...)` keeps the child in the tree — the
+`FormBuilderField`s stay registered with `FormBuilderState`, their
+controller values remain in `FormBuilderState.value`, and — crucially
+— their **validators still run during `saveAndValidate()`**. If step
+2's cover letter and terms checkbox were `Visibility(visible: false)`
+while the user is on step 1, tapping **Next** would call step-1's
+`saveAndValidate()` on the *entire* single form; the hidden
+`required()` on cover letter would fire and the transition would
+fail silently with no error rendered against a visible field. The
+user is stuck. Using `Offstage` has the same shape: it keeps the
+render object in the tree, only skipping paint. Two separate
+`FormBuilder`s solve this because a `FormBuilder` that is not in the
+tree has no `FormBuilderState` and no fields to validate; step 2's
+key returns `null` from `.currentState` until step 2 is mounted, and
+`Next` only ever calls step 1's `saveAndValidate`.
+
+---
+
+## STRETCH B — Animated field reveal
+
+Each `FormBuilderField` on both steps is wrapped in a private
+`_AnimatedFieldReveal` widget that combines `AnimatedOpacity` (0 → 1
+over 240 ms) and `AnimatedSlide` (offset `(0, 0.2)` → `Offset.zero`).
+Reveal is driven by a monotonic `int revealCount` stored in a
+`useState` hook; each field is assigned an index, and a field is
+"revealed" (opacity 1, offset zero) once `revealCount > index`.
+
+The reveal sequence is triggered from a `useEffect` hook keyed on
+`stepIndex.value`: when the step changes, the effect cancels any
+in-flight `Timer.periodic`, resets `revealCount.value = 0`, and
+starts a fresh 80 ms periodic timer that increments `revealCount`
+once per tick until every field on the current step is revealed. The
+effect's returned cleanup function cancels the timer if the widget
+unmounts or the step changes mid-sequence.
+
+**Why `useEffect()` is the right trigger.** `useEffect()` runs its
+callback **after** the widget mounts and after any change to its
+dependency list — the exact semantics we need: start the animation
+sequence at mount and restart it when the step index flips. Its
+return value is a **cleanup function** the hook framework calls when
+the effect re-runs (dependency change) or the widget unmounts,
+guaranteeing the `Timer.periodic` is cancelled — no dangling ticker,
+no state written to a disposed hook.
+
+**What would happen if we called `Timer.periodic(...)` directly
+inside `build()`?** Every rebuild would allocate and start a **new**
+timer. Multiple timers would race — `revealCount` would advance
+faster than intended and reach steady state within one or two
+rebuilds — and the old timers would leak, because no code cancels
+them (nothing holds a reference outside the build). Over the
+lifetime of the screen this would accumulate a handful of live
+timers per field interaction, each firing every 80 ms. The
+`useEffect` guard prevents both symptoms: it runs once at mount,
+and the returned cleanup cancels the old timer before starting the
+new one on any dependency change.
+
+**An implicit-animation alternative that avoids
+`AnimationController` entirely.** Wrap each field in a
+`TweenAnimationBuilder<double>` with `tween: Tween(begin: 0, end: 1)`
+and a `duration` that increases per field index (`Duration(milliseconds:
+240 + index * 80)` from a fixed start point at mount). The builder
+receives a `double t` per frame and can drive both the opacity and
+the slide offset in the returned widget. Trade-off:
+`TweenAnimationBuilder` allocates its own hidden `AnimationController`
+per field (still no explicit lifecycle for us to manage), so the
+memory cost is similar; but the reveal cannot be paused, reset, or
+re-triggered on step change without changing the `tween`'s identity,
+which retriggers the animation with a jarring jump if timing isn't
+perfectly synchronised. `useEffect + AnimatedOpacity + AnimatedSlide`
+is preferable when the sequence must reset cleanly on step changes,
+as it does here.
+
+---
+
+## STRETCH C — Offline application drafts
+
+When the user taps **Submit** and `isOfflineProvider` reports the
+device is offline, the form values (from
+`formKey.currentState!.value` on step 2 plus step 1's cached values)
+are written to Isar via a new `@collection class ApplicationDraft`.
+A SnackBar confirms — `'Saved as draft — will submit when back
+online.'` — and the screen pops.
+
+`ApplicationDraft` is a per-user-visible row keyed by an
+`Isar.autoIncrement` `id`, with fields `jobId`, `fullName`, `email`,
+`coverLetter`, `yearsExperience`, `startDate`, `portfolioUrl`,
+`terms`, and `savedAt`. `hasPendingDraftsProvider` reads
+`isar.applicationDrafts.count()` via a `.watch(fireImmediately: true)`
+stream and reports `true` when any draft exists. The jobs screen's
+top-of-list banner (inside `_JobList`) renders a persistent yellow
+"You have N application drafts waiting to sync" message whenever
+that provider returns `true`.
+
+**Reconnect drain.** The jobs screen's `build()` calls
+`ref.listen<bool>(isOfflineProvider, ...)` — a fire-once
+registration that survives every rebuild. When the callback observes
+a transition from `previous == true` to `next == false`, it reads
+`ApplicationDraftsController` and invokes `.syncPending()`. That
+method reads every row from Isar, "attempts" to submit each (the
+mock server has no `/applications` endpoint, so we treat the
+submission as unconditionally successful — see the failure-case note
+below), and deletes each row after a successful submit. The banner
+disappears when the count drops to zero via the Isar `.watch` stream.
+
+**Failure case — the API rejects a draft submission (e.g. the job
+listing has been closed).** In production the sync loop would treat
+each draft-submission independently: on 4xx the draft is retained
+and its `lastError` field is populated, on 5xx the whole loop
+aborts and retries at the next connectivity event, on network error
+the loop aborts silently. In the UI we would:
+
+- **Keep** the failed draft — the user's cover letter is not
+  disposable data. Deleting silently would be a data loss the user
+  never consented to.
+- Show a **red-tinted variant** of the drafts banner with a
+  "1 draft could not be submitted — the listing may have closed"
+  message and a **Review** action that navigates back to
+  `ApplyScreen(jobId: ...)` prefilled with the draft's values, so
+  the user can edit and resubmit or explicitly delete.
+- Expose a **Delete** action per-draft on that Review screen (the
+  only place the user can trigger destructive removal).
+
+**Is optimistic submission more or less appropriate for a job
+*application* than for a job *bookmark*?** _Less_ appropriate.
+Bookmarking a job is inherently retryable: the row on the server is
+a small idempotent record (this user finds this job interesting).
+Losing a queued bookmark is at worst a mild UX regression. A **job
+application**, by contrast, is a high-consequence, non-idempotent
+action: it consumes a slot in the employer's shortlist, involves a
+possibly-lengthy cover letter, and often has a deadline. The user
+must be informed of, and consent to, every submission — silent
+optimistic replay risks (i) double-submissions if the queue drains
+before the earlier attempt confirms, (ii) submitting to a listing
+that has since closed, (iii) submitting stale personal details the
+user meant to edit. The right pattern is a **draft** that the user
+must review and re-tap Submit to send once online. That is what
+Stretch C above provides: the offline path saves a draft and the
+reconnect path _would_, in a stricter production, surface the queue
+for the user to submit rather than auto-drain. We auto-drain here
+only because Assignment 3.1's brief explicitly asks for that
+behaviour and the mock server has no application endpoint to
+reject.
+
+The key distinction between the two actions: **bookmarking mutates
+user-scoped preference data; applying mutates cross-actor
+transactional data** — and the higher stakes flip the appropriate
+retry policy from silent optimistic replay to explicit
+user-confirmed replay.
+
+---
+
 # CareerHub — Assignment 2.4: Authentication and Secure API Flow
 
 _Written 2026-07-22._

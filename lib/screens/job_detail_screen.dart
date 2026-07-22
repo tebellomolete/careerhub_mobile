@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../data/saved_jobs_repository.dart';
 import '../models/job.dart';
@@ -211,18 +212,18 @@ class _JobDetailBody extends ConsumerWidget {
 
         const SizedBox(height: 28),
 
+        // Assignment 3.1, Part 7.2 — the navigation entry point
+        // to the apply form. `context.push` mounts ApplyScreen on
+        // top of the current shell branch, so the back gesture
+        // returns here.
         FilledButton.icon(
           onPressed: job.canApply
-              ? () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Application started for ${job.title}'),
-                    ),
-                  );
-                }
+              ? () => context.push('/jobs/${job.id}/apply')
               : null,
           icon: const Icon(Icons.send_outlined),
-          label: Text(job.canApply ? 'Apply now' : 'Applications closed'),
+          label: Text(
+            job.canApply ? 'Apply for this job' : 'Applications closed',
+          ),
         ),
         const SizedBox(height: 12),
         OutlinedButton.icon(

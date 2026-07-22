@@ -7,6 +7,8 @@ import 'package:careerhub_mobile/main.dart';
 import 'package:careerhub_mobile/models/auth_state.dart';
 import 'package:careerhub_mobile/models/job.dart';
 import 'package:careerhub_mobile/models/user.dart';
+import 'package:careerhub_mobile/data/application_draft.dart';
+import 'package:careerhub_mobile/providers/application_drafts_notifier.dart';
 import 'package:careerhub_mobile/providers/auth_notifier.dart';
 import 'package:careerhub_mobile/providers/filter_notifier.dart';
 import 'package:careerhub_mobile/providers/job_providers.dart';
@@ -154,6 +156,17 @@ Widget bootApp() {
       // behaviour). See README 2.4, § Test modification.
       authProvider.overrideWith(_FakeAuthNotifier.new),
       prefsProvider.overrideWithValue(_testPrefs),
+      // Assignment 3.1 Stretch C — the jobs screen's _TopBanners
+      // watches hasPendingDraftsProvider, which reads
+      // applicationDraftsStreamProvider, which reads isarProvider.
+      // isarProvider intentionally throws when not overridden, so
+      // we replace the stream provider directly with an empty
+      // stream. Overriding at the stream layer keeps the
+      // derivations (hasPendingDraftsProvider, pendingDraftsCountProvider)
+      // in-place and honest.
+      applicationDraftsStreamProvider.overrideWith(
+        (ref) => Stream<List<ApplicationDraft>>.value(const []),
+      ),
     ],
     child: const CareerHubApp(),
   );
@@ -221,15 +234,20 @@ void main() {
           findsOneWidget);
     });
 
-    testWidgets('Two filter dropdowns (Location and Job type) are present',
+    // Assignment 3.1, Part 3 — the two dropdowns have been
+    // replaced by a horizontally scrollable row of FilterChips
+    // (All, On-site, Remote, Hybrid) inside _FilterChips. The
+    // job-type dropdown was dropped in the refactor. Verify the
+    // four chips are present and the 'All' chip is initially
+    // selected.
+    testWidgets('Four location filter chips are present',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
-      expect(find.byType(DropdownButtonFormField<LocationType?>),
-          findsOneWidget);
-      expect(find.byType(DropdownButtonFormField<JobTypeFilter?>),
-          findsOneWidget);
-      expect(find.text('Location'), findsOneWidget);
-      expect(find.text('Job type'), findsOneWidget);
+      expect(find.byType(FilterChip), findsNWidgets(4));
+      expect(find.widgetWithText(FilterChip, 'All'), findsOneWidget);
+      expect(find.widgetWithText(FilterChip, 'On-site'), findsOneWidget);
+      expect(find.widgetWithText(FilterChip, 'Remote'), findsOneWidget);
+      expect(find.widgetWithText(FilterChip, 'Hybrid'), findsOneWidget);
     });
   });
 
@@ -368,22 +386,25 @@ void main() {
       expect(find.text('Senior Flutter Developer'), findsNothing);
     });
 
+    // Assignment 3.1, Part 3 — tapping the Remote FilterChip
+    // replaces tapping the location dropdown → picking Remote in
+    // the old menu. `_FilterChips.onSelected` calls
+    // `ref.read(filterProvider.notifier).select('remote')`, which
+    // matches `LocationType.remote.name`.
     testWidgets(
-        'tapping the Location dropdown opens the menu and picking Remote '
-        'updates the provider', (WidgetTester tester) async {
+        'tapping the Remote FilterChip updates filterProvider',
+        (WidgetTester tester) async {
       await pumpLoadedApp(tester);
       final container = containerFor(tester);
       // Default = the `kFilterAll` sentinel.
       expect(container.read(filterProvider), kFilterAll);
 
       await tester
-          .tap(find.byType(DropdownButtonFormField<LocationType?>));
+          .tap(find.widgetWithText(FilterChip, 'Remote'));
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Remote').last);
-      await tester.pumpAndSettle();
-
-      // The dropdown's `.select(...)` writes the enum name.
+      // FilterChip's onSelected writes the enum name via
+      // filterProvider.notifier.select(...).
       expect(container.read(filterProvider),
           LocationType.remote.name);
       expect(find.text('Senior Flutter Developer'), findsNothing);
@@ -391,9 +412,12 @@ void main() {
   });
 
   group('Sort + Search', () {
+    // Assignment 3.1, Part 3 — grid layout dropped. The list is
+    // now a vertical ListView, so "sorted order" is verified via
+    // dy (top-to-bottom position), not dx.
     testWidgets('sort menu reverses job order',
         (WidgetTester tester) async {
-      await pumpLoadedApp(tester, surface: const Size(800, 1400));
+      await pumpLoadedApp(tester);
 
       final container = ProviderScope.containerOf(
           tester.element(find.byType(CareerHubApp)));
@@ -402,29 +426,36 @@ void main() {
           .select(LocationType.remote.name);
       await tester.pump();
 
-      double dxOf(String title) => tester.getTopLeft(find.text(title)).dx;
+      double dyOf(String title) => tester.getTopLeft(find.text(title)).dy;
 
-      expect(dxOf('DevOps Engineer'),
-          lessThan(dxOf('Technical Support Engineer')));
+      expect(dyOf('DevOps Engineer'),
+          lessThan(dyOf('Technical Support Engineer')));
 
       await tester.tap(find.byIcon(Icons.sort_by_alpha));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Title: Z–A'));
       await tester.pumpAndSettle();
 
-      expect(dxOf('Technical Support Engineer'),
-          lessThan(dxOf('DevOps Engineer')));
+      expect(dyOf('Technical Support Engineer'),
+          lessThan(dyOf('DevOps Engineer')));
     });
 
-    testWidgets('search field filters jobs by title',
+    // Assignment 3.1, Part 3 — the always-visible search TextField
+    // has been replaced by a search icon in the AppBar that opens
+    // the built-in SearchDelegate on tap. The delegate's own
+    // AppBar owns the search TextField.
+    testWidgets('search icon opens a delegate that filters jobs by title',
         (WidgetTester tester) async {
       await pumpLoadedApp(tester);
 
       expect(find.text('Senior Flutter Developer'), findsOneWidget);
       expect(find.text('UX Researcher'), findsOneWidget);
 
+      await tester.tap(find.byIcon(Icons.search));
+      await tester.pumpAndSettle();
+
       await tester.enterText(find.byType(TextField), 'ux');
-      await tester.pump();
+      await tester.pumpAndSettle();
 
       expect(find.text('UX Researcher'), findsOneWidget);
       expect(find.text('Senior Flutter Developer'), findsNothing);
