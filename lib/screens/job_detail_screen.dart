@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/saved_jobs_repository.dart';
 import '../models/job.dart';
 import '../providers/job_providers.dart';
+import '../providers/saved_jobs_notifier.dart';
 import '../providers/jobs_notifier.dart';
 import '../widgets/icon_line.dart';
 import '../widgets/job_status_badge.dart';
@@ -224,15 +226,37 @@ class _JobDetailBody extends ConsumerWidget {
         ),
         const SizedBox(height: 12),
         OutlinedButton.icon(
-          onPressed: () {
-            final notifier = ref.read(savedJobIdsProvider.notifier);
-            final next = Set<String>.from(savedIds);
+          // Assignment 2.4 Stretch C — route through SavedJobsController
+          // so the save goes to Isar + the server (online) or to Isar
+          // as pending (offline). The savedJobIdsProvider we watch above
+          // now derives from the Isar stream, so the button label
+          // updates automatically as soon as the row is written.
+          onPressed: () async {
+            final controller = ref.read(savedJobsControllerProvider);
             if (isSaved) {
-              next.remove(job.id);
+              await controller.remove(job.id);
             } else {
-              next.add(job.id);
+              final outcome = await controller.save(job.id);
+              if (!context.mounted) return;
+              switch (outcome) {
+                case SaveOutcome.saved:
+                  break;
+                case SaveOutcome.queued:
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content:
+                          Text('Saved offline — will sync when back online.'),
+                    ),
+                  );
+                case SaveOutcome.notFound:
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                          'This listing is no longer available on the server.'),
+                    ),
+                  );
+              }
             }
-            notifier.state = next;
           },
           icon: Icon(isSaved ? Icons.bookmark : Icons.bookmark_border),
           label: Text(isSaved ? 'Saved' : 'Save this job'),

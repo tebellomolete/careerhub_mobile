@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../models/job.dart';
+import '../providers/auth_notifier.dart';
 import '../providers/connectivity_provider.dart';
 import '../providers/filter_notifier.dart';
 import '../providers/job_providers.dart';
@@ -64,9 +65,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       appBar: AppBar(
         title: const Text('CareerHub'),
         centerTitle: false,
-        actions: const [
-          _SortButton(),
-          SizedBox(width: 8),
+        actions: [
+          const _SortButton(),
+          // Assignment 2.4, Part 9.3 — the logout action. The
+          // ORDER is deliberate (see README 2.4, Q4): every
+          // user-scoped data provider is invalidated FIRST so
+          // its in-flight work is torn down while the widget
+          // tree still exists, and only THEN is
+          // `authNotifier.logout()` called, which flips state
+          // to Unauthenticated and lets the router redirect to
+          // /login.
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sign out',
+            onPressed: () {
+              ref.invalidate(jobsProvider);
+              // Stretch C — saved-jobs cache is user-scoped.
+              ref.invalidate(savedJobIdsProvider);
+              ref.read(authProvider.notifier).logout();
+            },
+          ),
+          const SizedBox(width: 8),
         ],
       ),
       body: Column(

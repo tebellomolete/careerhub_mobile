@@ -7,94 +7,67 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/isar_provider.dart';
 import 'core/prefs_provider.dart';
 import 'data/job_cache.dart';
+import 'data/saved_job_cache.dart';
+import 'providers/pending_sync_service.dart';
 import 'router/app_router.dart';
 
-/// Assignment 2.3, Part 4 — `main()` is now `Future<void>` and executes
-/// two I/O operations before the first widget builds.
+/// Assignment 2.3 → 2.4 — the boot sequence.
 ///
-/// The order is strict and every step is called out in README 2.3, Q3:
-///
-///   1. `WidgetsFlutterBinding.ensureInitialized()` — MUST be first.
-///      It constructs the `WidgetsBinding` singleton whose
-///      `BinaryMessenger` is the pipe every subsequent MethodChannel
-///      call (path_provider, shared_preferences, connectivity_plus,
-///      Isar's native init) routes through. Skipping it produces a
-///      `FlutterError: Binding has not yet been initialized` from
-///      `path_provider`'s very first invocation.
-///
-///   2. `getApplicationDocumentsDirectory()` — the platform documents
-///      directory that Isar will write its `.isar` file into. This is
-///      a MethodChannel call under the hood, which is why step 1 is
-///      required first.
-///
-///   3. `Isar.open([JobCacheSchema], directory: dir.path)` — opens the
-///      single application-scoped Isar instance. `JobCacheSchema` is
-///      emitted by `isar_community_generator` into `lib/data/job_cache.g.dart`
-///      when `build_runner` runs (Part 9); until then the IDE may
-///      underline `JobCacheSchema` here.
-///
-///   4. `SharedPreferences.getInstance()` — the singleton prefs
-///      instance. Cheap on subsequent calls but the first one loads
-///      the plist/XML off disk, so we do it once at boot rather than
-///      inside a widget's `build()`.
-///
-///   5. `runApp` with `ProviderScope` overrides for both providers —
-///      `overrideWithValue` takes effect the moment the container is
-///      constructed (before any `build()` runs), so every subsequent
-///      `ref.watch(isarProvider)` / `ref.watch(prefsProvider)` sees
-///      the real instance, not the stubs from `lib/core/`.
+/// Assignment 2.4 changes:
+///   - `Isar.open` opens with `[JobCacheSchema, SavedJobCacheSchema]`
+///     (Stretch C's persistent bookmark queue).
+///   - `CareerHubApp` reads `appRouterProvider` (renamed from
+///     the plain `goRouterProvider` in earlier assignments) —
+///     the router is now a `@riverpod` function that participates
+///     in the dependency graph.
+///   - After `runApp`, we read `pendingSyncServiceProvider` once
+///     so the connectivity listener starts immediately without
+///     needing a widget to hydrate it.
 Future<void> main() async {
-  // Step 1 — see README 2.3, Q3.
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Step 2 — the documents directory. `await`ed because
-  // path_provider's MethodChannel call is inherently async.
   final dir = await getApplicationDocumentsDirectory();
 
-  // Step 3 — Isar.open. The schema list references the class the
-  // generator produced a descriptor for.
   final isar = await Isar.open(
-    [JobCacheSchema],
+    // Assignment 2.4 Stretch C — SavedJobCacheSchema is emitted
+    // by isar_community_generator into lib/data/saved_job_cache.g.dart.
+    [JobCacheSchema, SavedJobCacheSchema],
     directory: dir.path,
   );
 
-  // Step 4 — SharedPreferences.
   final prefs = await SharedPreferences.getInstance();
 
-  // Step 5 — inject both real instances into the provider container
-  // via `overrideWithValue`. Every `ref.watch` on `isarProvider` /
-  // `prefsProvider` from any `build()` in the tree now returns the
-  // resolved instance synchronously.
+  final container = ProviderContainer(
+    overrides: [
+      isarProvider.overrideWithValue(isar),
+      prefsProvider.overrideWithValue(prefs),
+    ],
+  );
+
+  // Assignment 2.4 Stretch C — bring up the pending-sync
+  // listener. Reading the provider once is enough to construct
+  // it and start its connectivity subscription; the closure it
+  // returns is captured by the provider container until dispose.
+  container.read(pendingSyncServiceProvider);
+
   runApp(
-    ProviderScope(
-      overrides: [
-        isarProvider.overrideWithValue(isar),
-        prefsProvider.overrideWithValue(prefs),
-      ],
+    UncontrolledProviderScope(
+      container: container,
       child: const CareerHubApp(),
     ),
   );
 }
 
-/// Assignment 1.4: CareerHubApp becomes a ConsumerWidget so it can read the
-/// GoRouter out of goRouterProvider, and switches from MaterialApp with a
-/// `home:` to MaterialApp.router driven by that router. The URL is now the
-/// source of truth for what is on screen — there is no single home widget
-/// any more.
-///
-/// Assignment 2.3 note: the root widget did NOT change for 2.3. Only
-/// `main()` above changed.
 class CareerHubApp extends ConsumerWidget {
   const CareerHubApp({super.key});
 
-  // Same deep-teal seed from Assignment 1.1. Part 3a requires reusing it,
-  // not choosing a new one — light and dark themes should read as the
-  // same app, not two different apps.
   static const Color _seedColor = Color(0xFF00695C);
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final router = ref.watch(goRouterProvider);
+    // Assignment 2.4, Part 9.2 — the router is now
+    // `appRouterProvider` (the @riverpod-generated version).
+    final router = ref.watch(appRouterProvider);
 
     return MaterialApp.router(
       title: 'CareerHub',
@@ -110,9 +83,7 @@ class CareerHubApp extends ConsumerWidget {
           brightness: Brightness.dark,
         ),
       ),
-      // Follows the device's system setting rather than forcing one mode.
       themeMode: ThemeMode.system,
-      // Wires GoRouter's parser, delegate and back-button dispatcher in.
       routerConfig: router,
     );
   }

@@ -6,6 +6,15 @@
          offline banner never appears on Android. Must sit immediately
          before <application>. See README 2.3, Part 2. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Assignment 2.4 Stretch B — biometric auth. USE_BIOMETRIC
+         (API 28+) is the current permission; USE_FINGERPRINT is
+         the pre-28 name. Declaring both keeps API 23–27 devices
+         (which we still support because minSdk=23) able to prompt
+         with fingerprint even though the modern BiometricPrompt
+         constant is unavailable. See local_auth's Android integration
+         section. -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     <!-- Assignment 2.1 — usesCleartextTraffic="true".
          Our CareerHub API runs on http://10.0.2.2:5254 in development
          (the Android emulator's alias for the host machine's localhost).

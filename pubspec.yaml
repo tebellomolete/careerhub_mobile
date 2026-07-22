@@ -62,6 +62,18 @@ dependencies:
   # `List<ConnectivityResult>` (plural) as of 5.0 because a device can be
   # reachable through multiple network interfaces at once.
   connectivity_plus: ^6.1.0
+  # Assignment 2.4 — the secure-storage plugin. iOS Keychain,
+  # Android EncryptedSharedPreferences (which is why the Android
+  # build.gradle.kts overrides `minSdk` to 23 — see README 2.4,
+  # Q1's third bullet). No fromJson/toJson needed — the two
+  # values we persist are the access token and refresh token
+  # strings, both opaque to the client.
+  flutter_secure_storage: ^9.2.2
+  # Assignment 2.4 Stretch B — biometric re-auth gate. Used from
+  # AuthNotifier.build() at cold boot before returning
+  # Authenticated. Falls back gracefully on devices with no
+  # enrolled biometrics (see AuthNotifier for the branching).
+  local_auth: ^2.3.0
 
 dev_dependencies:
   flutter_test:

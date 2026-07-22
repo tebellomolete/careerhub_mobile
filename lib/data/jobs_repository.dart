@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:isar_community/isar.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -6,7 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/isar_provider.dart';
 import '../core/prefs_provider.dart';
 import '../models/job.dart';
+import '../providers/auth_provider.dart';
 import 'api_result.dart';
+import 'auth_interceptor.dart';
 import 'job_cache.dart';
 import 'job_dto.dart';
 
@@ -61,8 +64,20 @@ const String _resolvedBaseUrl = _envName == 'prod'
     ? _envProdBaseUrl
     : (_envName == 'staging' ? _envStagingBaseUrl : _envDevBaseUrl);
 
-/// Assignment 2.1 — the configured Dio instance, exposed through a
-/// generated Riverpod provider.
+/// Assignment 2.1 → 2.4 — the configured Dio instance.
+///
+/// Assignment 2.4 additions (Part 9.1):
+///   - A second, plain `retryDio` instance is created alongside
+///     the main client. It has ONLY the baseUrl set and NO
+///     interceptors — this is the Dio the AuthInterceptor uses
+///     to POST to `/auth/refresh` and to replay the original
+///     request. Its lack of interceptors is what breaks the
+///     infinite-refresh-loop analysed in README 2.4, Q3.
+///   - `AuthInterceptor` is added AFTER `LogInterceptor` on the
+///     main client. The order matters: LogInterceptor sits at
+///     the top of the chain and logs the raw request/response,
+///     AuthInterceptor sits below it and rewrites the
+///     Authorization header + handles 401s.
 @Riverpod(keepAlive: true)
 Dio dio(Ref ref) {
   final client = Dio(
@@ -84,6 +99,26 @@ Dio dio(Ref ref) {
     responseBody: false,
     error: true,
   ));
+
+  // Assignment 2.4, Part 9.1 — the retry Dio the AuthInterceptor
+  // uses to POST /refresh and to replay the original request. No
+  // interceptors, same baseUrl.
+  final retryDio = Dio(
+    BaseOptions(
+      baseUrl: _resolvedBaseUrl,
+      connectTimeout: const Duration(seconds: 10),
+      receiveTimeout: const Duration(seconds: 15),
+      headers: const {'Accept': 'application/json'},
+    ),
+  );
+
+  client.interceptors.add(
+    AuthInterceptor(
+      storage: const FlutterSecureStorage(),
+      retryDio: retryDio,
+      onUnauthenticated: ref.read(onUnauthenticatedProvider),
+    ),
+  );
 
   return client;
 }

@@ -13,6 +13,7 @@ import 'package:flutter_riverpod/legacy.dart';
 import '../models/job.dart';
 import 'filter_notifier.dart';
 import 'jobs_notifier.dart';
+import 'saved_jobs_notifier.dart';
 
 /// Assignment 2.1 — this file used to own the `_mockJobs` list, the
 /// hardcoded `jobsProvider` FutureProvider, AND the fail-simulation
@@ -140,9 +141,33 @@ final visibleJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
 });
 
 /// ---------------------------------------------------------------------
-/// Assignment 1.4 — the set of job ids the user has saved.
+/// Assignment 1.4 → 2.4 (Stretch C) — the set of job ids the user has
+/// saved.
+///
+/// **Assignment 2.4 Stretch C rewrite.** Previously a
+/// `StateProvider<Set<String>>` initialised to an empty set (a fresh
+/// launch always started with no saved jobs). It is now a plain
+/// Provider that DERIVES from `savedJobIdsStreamProvider` (in
+/// `lib/providers/saved_jobs_notifier.dart`), which itself watches
+/// the Isar `SavedJobCache` collection. Saves are persisted across
+/// force-close, offline saves are queued for later sync, and both
+/// paths flow through the SavedJobsRepository — never through this
+/// provider directly.
+///
+/// The provider is kept under its historical name so existing call
+/// sites (`ref.watch(savedJobIdsProvider)` in JobCard, SavedScreen,
+/// and JobDetailScreen) keep working with no rename. Mutations go
+/// through `ref.read(savedJobsControllerProvider).save(jobId)` /
+/// `.remove(jobId)` instead of writing directly to this provider —
+/// see `SavedJobsController`.
 /// ---------------------------------------------------------------------
-final savedJobIdsProvider = StateProvider<Set<String>>((ref) => <String>{});
+final savedJobIdsProvider = Provider<Set<String>>((ref) {
+  final async = ref.watch(savedJobIdsStreamProvider);
+  return async.maybeWhen(
+    data: (ids) => ids,
+    orElse: () => const <String>{},
+  );
+});
 
 /// The saved jobs as a derived list, resolved against the raw job list
 /// via the notifier.
@@ -153,11 +178,6 @@ final savedJobsProvider = Provider<AsyncValue<List<Job>>>((ref) {
     (jobs) => jobs.where((job) => savedIds.contains(job.id)).toList(),
   );
 });
-
-/// ---------------------------------------------------------------------
-/// Stretch C (Assignment 1.4) — authentication state. Unchanged from 1.4.
-/// ---------------------------------------------------------------------
-final isLoggedInProvider = StateProvider<bool>((ref) => false);
 
 /// ---------------------------------------------------------------------
 /// Stretch B (Assignment 2.2) — the user's IN-PROGRESS edited copy of

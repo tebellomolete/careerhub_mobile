@@ -1,3 +1,788 @@
+# CareerHub — Assignment 2.4: Authentication and Secure API Flow
+
+_Written 2026-07-22._
+
+Week 2, Assignment 2.4. This section contains the four written decisions
+(Part 1), the auth models, repository, notifier, provider bridge, and Dio
+interceptor, the router/login-screen changes, the app-wiring, the six
+demo-scenario write-ups, the three stretch goals (A: token expiry
+countdown, B: biometric re-auth gate, C: offline save queue), the
+test-modification note, and the terminal-output/screenshot placeholders.
+The Assignment 2.3 and earlier notes are preserved further down as
+historical context.
+
+---
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — Token storage and platform security boundaries
+
+**Why `SharedPreferences` is wrong for access/refresh tokens (Android).**
+On Android, `SharedPreferences` writes to a plain XML file at
+`/data/data/<applicationId>/shared_prefs/<name>.xml` (for CareerHub,
+that resolves to
+`/data/data/com.example.careerhub_mobile/shared_prefs/FlutterSharedPreferences.xml`).
+The permission model that governs that file is standard Linux DAC: the
+Android package installer assigns each app a unique UID at install time
+and `chown`s the app's `/data/data/<applicationId>` directory to that
+UID with mode `0700`, so under normal circumstances only processes
+running as that UID (i.e. the app itself) can read the file — the
+operating system does not decrypt or otherwise obscure the file
+contents. **The concrete attack that makes this inappropriate for
+credentials, even on a non-rooted device, is `adb backup`.** On any
+device that has USB debugging enabled (the demo emulator, any dev
+device, and any user who has ever enabled it to install a sideloaded
+app), an attacker with brief physical or network-forwarded access can
+run `adb backup -f out.ab -noapk com.example.careerhub_mobile`, which
+uses Android's built-in Backup Manager to pull `shared_prefs/` out of
+the app's private directory without root and without an unlock (the
+prompt is a bypassable on-device confirmation dialog). The resulting
+`.ab` archive is trivially unwrapped with `dd bs=24 skip=1
+if=out.ab | zlib-flate -uncompress | tar -xvf -`; the XML file is then
+plaintext, and any access token or refresh token stored inside is
+readable directly. The token is a bearer credential — whoever holds
+it authenticates as the user, no password required, until it expires.
+`flutter_secure_storage` sidesteps this because
+`EncryptedSharedPreferences` encrypts each value with a
+Keystore-resident key (see the third bullet below); the same
+`adb backup` produces an XML that contains ciphertext plus IV, not the
+token.
+
+**What the iOS Keychain provides that a file on disk does not.**
+1. **Passcode-gated availability class.** Every Keychain item is
+    stored with an accessibility attribute. On CareerHub, the default
+    `flutter_secure_storage` write uses an accessibility class that
+    binds decryption to the device's passcode/biometric state — if
+    the user has never set a device passcode (`kSecAttrAccessible…`
+    values that end in `ThisDeviceOnly`), the item does not exist at
+    all; if a passcode is set, decryption is only possible while
+    (depending on the class) the device is unlocked or has been
+    unlocked at least once since boot. A raw file on disk has no
+    such gate — an attacker with the file has the file.
+2. **Hardware-backed key custody on Secure Enclave devices.** On
+    every iPhone with a Secure Enclave (5s and later), the
+    per-Keychain-item cryptographic key is generated and stored
+    inside the SEP — a separate ARM co-processor with its own memory
+    that the application processor cannot address directly. Decryption
+    is a cross-processor request; the plaintext key never appears in
+    application memory even during a legitimate read. A file on disk
+    is protected only by the file-system encryption key held in
+    normal DRAM.
+
+    **`kSecAttrAccessibleWhenUnlocked` vs
+    `kSecAttrAccessibleAfterFirstUnlock`.** `WhenUnlocked` gates
+    decryption on the device currently being in the unlocked state —
+    a background wake-up in a locked device cannot read the item.
+    `AfterFirstUnlock` requires that the device has been unlocked
+    at least once since boot; subsequent locks do not gate the read.
+    **For tokens that must survive an app reinstall we choose
+    `kSecAttrAccessibleAfterFirstUnlock`** (specifically the
+    `first_unlock_this_device` accessibility in
+    `flutter_secure_storage`'s `IOSOptions`), because reinstall
+    preserves Keychain items only when the accessibility class does
+    not end in `ThisDeviceOnly` and (equally important) does not
+    require the app to be foreground — the OS may need to hydrate the
+    tokens for a background boot task before the user has actively
+    unlocked the phone during that session.
+
+**Why Android's `flutter_secure_storage` requires SDK 23.**
+`EncryptedSharedPreferences` (part of `androidx.security:security-crypto`)
+provides authenticated envelope encryption on top of a normal
+`SharedPreferences` file: every value is encrypted with a data-encryption
+key (AES-256-GCM), and that DEK is itself wrapped by a key-encryption
+key that lives in the **Android Keystore** — the OS-level, hardware-
+backed keystore system introduced in **API 23 (Android 6.0
+Marshmallow)**. Below API 23 the Keystore APIs `EncryptedSharedPreferences`
+depends on (`KeyGenParameterSpec` + `AndroidKeyStore`'s
+`AES/GCM/NoPadding` support) do not exist, so it cannot generate or
+retrieve its master key. Running the app on an API 21 or 22 device
+compiles, installs, and boots without warning — then the first
+`flutter_secure_storage` read or write throws
+**`java.lang.NoSuchAlgorithmException`** (wrapped by
+`flutter_secure_storage`'s platform code as a `PlatformException` on
+the Flutter side, whose underlying exception is a `NoSuchAlgorithmException`
+originating from `AndroidKeyStore.engineGetKey` when trying to fetch
+the `AES/GCM/NoPadding` master key). Raising `minSdk` from 21 to 23
+in `android/app/build.gradle.kts` (Step 2.2) makes the app
+uninstallable on those devices, which is what turns a runtime crash
+into a `Play Store: this device is not compatible` message at
+install time.
+
+### Question 2 — The sealed `AuthState` and the two-layer state machine
+
+**Why a Dart enum is insufficient.** A Dart `enum` is a closed set of
+**singleton constant values with no per-constant fields**. Every
+member of an enum has the same shape as every other member — you can
+enrich an enum by adding a `final` field to the enum class itself,
+but then **every** member must supply the same field, of the same
+type, at declaration time. Our four `AuthState` variants have
+irreconcilably different payload shapes: `Unauthenticated` and
+`Authenticating` have no fields, `Authenticated` carries a `final
+User user`, and `AuthError` carries a `final String message`. Modelling
+these as an enum forces one of two bad options: (a) declare `User?
+user` and `String? message` on the enum class and rely on convention
+("only read `user` when this is `Authenticated`") — which the
+compiler cannot enforce and which spreads null-checks across every
+consumer, or (b) box the payload in a shared `Object?` field, which
+loses the type on both variants and requires an unchecked cast at
+every read. **What a sealed class expresses that the enum cannot** is
+that each variant is a **distinct type** with its own field declarations
+— the compiler knows `Authenticated` has a non-nullable `User` and
+`AuthError` has a non-nullable `String`, and inside a `switch`
+expression's `case Authenticated(:final user)` pattern the `user`
+binding has the static type `User`, no cast, no null-check, no
+runtime failure mode. This is exactly the property Dart 3 pattern
+matching over sealed types was added to give.
+
+**The two distinct loading states.** They look identical to the
+`AsyncValue` type system — both are "not yet resolved" — but they
+originate from different mechanisms and describe different user
+situations, and only one of them is visible to the user.
+
+1. **The `AsyncValue.loading` state emitted while
+    `AuthNotifier.build()` is executing.** Triggered by: cold boot.
+    `authNotifierProvider`'s `AsyncNotifier.build()` is running its
+    async body (read the token out of secure storage → decode it →
+    possibly call `tryRefresh`) and has not yet returned a value.
+    From the router's perspective, `ref.read(authNotifierProvider)`
+    returns an `AsyncLoading<AuthState>`; the redirect callback checks
+    `.isLoading` and returns `null`, which means "do nothing, let
+    the current route stand" — no navigation happens. **What the
+    user sees:** the `initialLocation` route (`/jobs`) is briefly on
+    screen behind a small `CircularProgressIndicator` (jobs
+    themselves are still loading too), and within a hundred
+    milliseconds `build()` resolves to either `Unauthenticated` — in
+    which case the redirect fires and the user lands on `/login` —
+    or `Authenticated`, in which case they stay on `/jobs`.
+
+2. **The `Authenticating` subtype of `AuthState` that is emitted
+    during a login call.** Triggered by: the user tapping the "Sign
+    in" button on the login screen. `AuthNotifier.login(email,
+    password)` sets `state = AsyncData(Authenticating())` before any
+    `await`, then calls the repository. From the router's
+    perspective, `ref.read(authNotifierProvider)` returns an
+    `AsyncData(Authenticating())` — a **resolved** `AsyncValue`, not
+    a loading one — so the redirect's `.isLoading` check returns
+    `false` and it inspects the concrete value. Because
+    `Authenticating` is not `Authenticated`, the redirect keeps the
+    user on `/login`. **What the user sees:** the "Sign in" button
+    on the login screen is replaced by a small
+    `CircularProgressIndicator` (the button is disabled during this
+    state) and the email/password fields remain populated so a
+    subsequent retry doesn't lose their input.
+
+**Why `redirect` uses `ref.read` and `appRouter` uses `ref.watch`.**
+`ref.watch` inside a widget or provider body creates a **subscription**
+— when the watched provider changes, the watching widget/provider
+rebuilds. Using `ref.watch(authNotifierProvider)` **inside the
+redirect callback** would attach a new subscription to
+`authNotifierProvider` **every time GoRouter invoked the callback**,
+and would tie the callback's identity to that provider's value. The
+concrete rebuild cycle is: (i) route change → redirect callback runs
+→ `ref.watch` registers a subscription and reads the current
+`AuthState`; (ii) some later state change fires the subscription →
+the router provider itself rebuilds because a watched dependency
+changed → GoRouter re-runs redirect → another `ref.watch` fires,
+another subscription is attached; (iii) any state change now
+notifies **all** the accumulated subscriptions, each of which
+re-triggers redirect. **The symptom the user observes** is an
+infinite navigation loop: the log fills with `[redirect]` lines and
+the app either freezes on `/login` or ping-pongs between `/login`
+and `/jobs` faster than the eye can follow. **Why `ref.watch` in
+the `appRouter` provider body is correct**: `appRouter` is a
+`@riverpod` function whose value is a `GoRouter` instance. Watching
+`authStateListenableProvider` inside that body creates **one**
+subscription that is torn down and re-created only when the whole
+router is rebuilt (which happens exactly once per container). It
+does not create per-redirect subscriptions. The `AuthStateListenable`
+that watch returns is a `ChangeNotifier` handed to GoRouter's
+`refreshListenable`, which is a **push-based** notification path
+(GoRouter re-runs redirect when the listenable fires) that does not
+depend on `ref.watch`/`ref.read` for its callback signal. The two
+are not contradictory — one wires the notifier into GoRouter's
+refresh mechanism, the other looks up the current auth value at the
+moment a route is being resolved.
+
+### Question 3 — The two-Dio architecture and the concurrent 401 queue
+
+**The infinite loop if login/tryRefresh used `dioProvider`.** Trace:
+(1) `AuthRepository.tryRefresh()` calls `dio.post('/api/v1/auth/refresh',
+data: { refreshToken })`. (2) The server rejects the refresh token
+(expired, revoked, or unknown) with `401 Unauthorized`. (3) Dio
+routes the response through its interceptor chain — `AuthInterceptor`
+sees a `DioException` with `response.statusCode == 401`. (4)
+`AuthInterceptor.onError` matches **Case 4** (401, no refresh in
+progress), sets `_isRefreshing = true`, reads the refresh token
+from secure storage, and calls `retryDio.post('/api/v1/auth/refresh',
+data: { refreshToken })`. But if `retryDio` were the *same* Dio as
+`dio` (as it would be if `AuthRepository` also read from
+`dioProvider`), then step 4's POST goes back through the interceptor
+chain — including `AuthInterceptor` itself. (5) The server rejects
+this refresh call the same way (same expired token). (6)
+`AuthInterceptor.onError` fires **on the retry**. Case 4 tries to
+set `_isRefreshing = true`, but the current call frame already did
+that — so it falls into the case that matches (in the naive
+implementation, another Case 4). (7) It calls
+`retryDio.post('/api/v1/auth/refresh', ...)` again. **The loop never
+exits** because each level of recursion adds a new
+`_isRefreshing = true` set-and-later-unset in its own `finally`,
+and each 401 spawns another call to `/refresh` from inside the
+same interceptor chain. Using a **plain Dio** for `login()` and
+`tryRefresh()` — one with only `baseUrl` set and **no interceptors**
+— breaks the cycle at step 4: the retry doesn't go through
+`AuthInterceptor`, so a 401 on `/refresh` propagates back to the
+caller as an ordinary `DioException` that the `tryRefresh` method
+catches, and the loop is impossible.
+
+**Three concurrent 401s + refresh-token rotation.** Suppose the
+access token expires at t=T and three unrelated widgets fire their
+API calls at t=T+1ms. All three arrive at the server carrying the
+same expired access token; all three receive `401 Unauthorized`
+simultaneously. **Without** the `Completer` queue, all three would
+independently enter Case 4 of `AuthInterceptor.onError` — each
+would read the same refresh token from secure storage and POST it
+to `/api/v1/auth/refresh`. On the server side, because we implement
+**refresh-token rotation**, the store atomically removes the
+presented token and inserts a new one on the very first successful
+refresh. The other two refreshes now arrive carrying a **token
+that no longer exists** in the store — the server sees an unknown
+refresh token and returns `401`. All three interceptor call sites
+now clear secure storage, invoke `onUnauthenticated`, and the user
+is logged out **despite one of the three refresh attempts having
+succeeded**. Worse, the successful refresh's new tokens are written
+to secure storage, then immediately deleted by the other two failing
+call sites' `deleteAll()` — the app has a valid session written to
+disk for a few milliseconds and then throws it away.
+
+**How the `Completer<String>` queue solves this.** The **first** 401
+takes Case 4 with `_isRefreshing == false`: it flips the flag to
+`true` under a `try`/`finally` and begins the refresh call. The
+**second and third** 401s each take Case 3 (`_isRefreshing == true`):
+each creates a `Completer<String>`, adds it to the `_queue` list,
+and `await`s the completer's future — this parks them without
+consuming any thread, without hitting the network, and without
+touching secure storage. When the first refresh completes
+successfully, Case 4's success branch writes the new access and
+refresh tokens to storage, then walks `_queue` and calls
+`complete(newAccessToken)` on every completer. The two parked
+call sites resume from their `await`, receive the new access token
+as the resolved value, attach it to their original request's
+`Authorization` header, and call `retryDio.fetch(request)` to
+replay the original API call — which now succeeds because the
+token is valid. If the first refresh **fails** instead (Case 4's
+exception branch), `_drainQueue(err)` walks the queue and calls
+`completeError(err)` on every completer; the two parked call sites
+then throw out of their `await` into the `catch` of the surrounding
+`try` and call `handler.next` with the error, which propagates the
+401 to the caller unchanged.
+
+**The refresh-endpoint 401 guard.** Case 2 catches a very specific
+scenario: the app calls `/api/v1/auth/refresh` (which uses `retryDio`,
+so `AuthInterceptor` doesn't run on the outbound), but the server
+responds with `401` because the refresh token itself is invalid —
+say the user was manually revoked, the server was reseeded, or the
+refresh token expired. **Wait, `retryDio` has no interceptors — so
+how does `AuthInterceptor` see this 401?** It sees it because
+`AuthInterceptor` runs on the *authenticated* `dio`, and Case 4's
+`retryDio.post` is called from *inside* `AuthInterceptor.onError`
+after the original 401 from a user-facing API call. If the original
+call was itself the /refresh endpoint (a scenario that arises if a
+future feature wires refresh into the authenticated `dio`, or if a
+test uses `dio` to hit /refresh directly), Case 4 would try to
+refresh a token that was already the refresh call — an infinite
+retry loop with no guard. The guard's purpose is: **when the failing
+request path contains `/auth/refresh`, do NOT attempt to refresh
+again — the refresh itself has failed, so the session is definitively
+over.** Case 2 calls `_drainQueue(err)`, `storage.deleteAll()`,
+`onUnauthenticated()`, and `handler.next(err)`. **Without the
+guard**, the state after a failed refresh is: `_isRefreshing == true`
+(from the outer Case 4 frame), `_queue` holds one or more parked
+completers, and `onUnauthenticated` never fires. `AuthNotifier` is
+never invalidated so the state stays `Authenticated`; the router's
+redirect callback keeps returning `null` for authenticated users;
+every new API call parks another completer that will never be
+completed. **The user never sees the login screen** even though
+their session has definitively ended — the app hangs on any screen
+that fires an API call, forever.
+
+### Question 4 — Logout ordering and the circular import problem
+
+**Reversed order — the disposal race.** Assume the button calls
+`logout()` first, then `ref.invalidate(jobsNotifierProvider)`. Now
+suppose that at the moment of the tap, `JobsNotifier` has a
+`getJobs()` request in flight — the user opened the app three
+seconds ago on a slow connection, the initial fetch is still
+running. `logout()` awaits `authRepository.logout()` (a
+`deleteAll()` on secure storage), then sets `state =
+AsyncData(Unauthenticated())`. That state change fires the
+`AuthStateListenable`, GoRouter re-runs `redirect`, `redirect`
+returns `/login`, the router **tears down the `StatefulShellRoute`
+subtree** — every widget that was reading `jobsNotifierProvider`
+unmounts. In production Riverpod that would normally dispose the
+notifier (Riverpod treats an unlistened provider as garbage), but
+the in-flight `Future` inside `JobsNotifier.build()` has a **live
+`ref`** captured in its closure. Two race conditions can happen:
+(1) the in-flight fetch resolves *after* the state has already
+transitioned to `Unauthenticated`, tries to write `state =
+AsyncData(freshJobs)` on a disposed notifier, and throws
+`StateError: Cannot use ref after the provider was disposed`; (2)
+the fetch resolves *before* disposal, writes its result to Isar,
+and after logout the cached jobs are still on disk — the next user
+who logs in on this device sees the previous user's jobs list until
+the next network fetch overwrites the cache. **Explicit
+`ref.invalidate` before the redirect is safer** because invalidation
+runs synchronously: the current `JobsNotifier` is disposed, its
+in-flight future is cancelled (Riverpod attaches a cancellation
+guard to the future), and the notifier is rebuilt fresh in a state
+where the authenticated `dio`'s next call will 401 (and, given the
+interceptor, immediately clear storage and land on `/login`). The
+key insight is that the user-triggered `ref.invalidate` runs *while
+the widget tree still exists* — the tree owns the notifier and can
+tear it down cleanly — whereas relying on the router-driven
+teardown means disposal happens *because the widget tree is being
+removed*, which is a race with any in-flight work.
+
+**The circular import chain a naive implementation would create.**
+Naive placement: `AuthNotifier.logout()` calls
+`ref.invalidate(jobsNotifierProvider)` before clearing storage.
+This requires `auth_notifier.dart` to
+`import '../providers/jobs_notifier.dart'`. Now the chain: **(1)**
+`lib/providers/auth_notifier.dart` imports
+`lib/providers/jobs_notifier.dart` (to call `.invalidate` on the
+generated `jobsProvider`). **(2)** `lib/providers/jobs_notifier.dart`
+imports `lib/data/jobs_repository.dart` (to construct the notifier
+around `JobsRepository`). **(3)** `lib/data/jobs_repository.dart`
+imports `lib/data/auth_interceptor.dart` (so `dioProvider` can
+install the interceptor). **(4)** `lib/data/auth_interceptor.dart`
+imports … well, in the *correct* design it does not import anything
+from `providers/`, but the *naive* design would have the interceptor
+call `authNotifierProvider` directly to invalidate on 401 — which
+would import **(Z)** `lib/providers/auth_notifier.dart`. The cycle
+is now **`auth_notifier.dart → jobs_notifier.dart → jobs_repository.dart
+→ auth_interceptor.dart → auth_notifier.dart`**. The specific error
+Dart's toolchain produces depends on the shape: for a pure-Dart
+cyclic top-level `const` reference the compiler emits **`Error:
+Constant evaluation error: … cycle detected while attempting to
+evaluate <constant>`**; for the more common shape here — where the
+cycle is in the import graph but each file's top-level `part`
+directive references a `.g.dart` that is itself generated from a
+`@riverpod` annotation — `build_runner` emits **`Cycle detected in
+Riverpod provider dependency graph: authNotifierProvider →
+jobsProvider → dioProvider → authNotifierProvider`**, causing
+generation to abort and no `.g.dart` files to be written. The fix
+adopted by the assignment is to introduce
+`lib/providers/auth_provider.dart` — a leaf module that neither
+`auth_notifier.dart` nor `auth_interceptor.dart` imports, and that
+exposes an indirection provider (`onUnauthenticatedProvider`)
+whose value is a `void Function()` closure that the interceptor
+receives at construction time. The interceptor holds a **function
+pointer**, not a symbol from `providers/`; no cycle exists.
+
+**Why `AsyncData(Unauthenticated())` and not `AsyncError` on
+logout.** `AsyncError` semantically means "the async operation
+failed" — the router's `redirect` and any error-boundary widget
+would present the state as a **problem** the user needs to recover
+from (retry buttons, error banners, "Something went wrong"
+screens). Logout is a **successful, deliberate** transition — the
+user chose to end their session — so the resulting `AuthState`
+must be a plain `AsyncData` wrapping the `Unauthenticated`
+variant. The downstream sequence: (1) `AuthNotifier.state`
+transitions to `AsyncData(Unauthenticated())`. (2)
+`filteredJobsProvider` — which had already been invalidated by
+the caller before `logout()` fired — is now in
+`AsyncLoading<List<Job>>` state (its underlying `jobsProvider`'s
+`build()` is being re-run against a `dio` whose access token was
+just deleted; the fetch will 401 and then, via the interceptor,
+`onUnauthenticated` fires and confirms the state). What the jobs
+screen *would* show during the redirect is a `CircularProgressIndicator`
+briefly — but in practice the redirect fires within the same
+microtask, so the user never sees that transient state; the
+screen swaps to `/login` first. (3) The Isar `jobCaches`
+collection is **not** cleared by logout — the cache is unrelated
+to authentication, and cross-user cache leakage is not a concern
+for CareerHub because `Job` records are public listing data (no
+per-user personalisation lives in that collection). If the app
+grew a `SavedJobCache` collection (Stretch C), that WOULD be
+per-user and would need to be cleared on logout — a follow-up
+concern not present in the base assignment. (4) On the next cold
+boot on a **new device** where secure storage is empty but Isar
+has never been cleared (e.g. a full-device backup restore that
+excludes Keychain by policy, or a device migration that mis-
+copied Isar files but not tokens): `AuthNotifier.build()` reads
+storage, finds nothing, returns `Unauthenticated`; `redirect`
+sends the user to `/login`; the `/login` screen never reads
+`jobsNotifierProvider` (it lives outside the shell) so the stale
+cache is never rendered. Only after the user logs in and the
+jobs screen mounts does the cache surface — and at that moment
+`JobsNotifier.build()`'s cache-then-network sequence will
+immediately overwrite the stale cache with fresh data from the
+authenticated call. The user briefly sees old cached listings
+until the network reply lands, then the list refreshes. This is
+acceptable for job listings (public data); for per-user data,
+Stretch C's `SavedJobCache` handling would need an explicit
+per-user namespacing or a logout-time collection wipe.
+
+---
+
+## PART 2 — PART 9 SUMMARY
+
+The remaining parts (2–9) and the demo write-ups follow. This section
+is filled in after the implementation lands; the placeholders below
+match the assignment's README-requirements table.
+
+- **Cold boot demo** — see **§ Cold boot demo** below.
+- **Logout demo** — see **§ Logout demo** below.
+- **Token persistence demo** — see **§ Token persistence demo** below.
+- **Invalid credentials demo** — see **§ Invalid credentials demo** below.
+- **Valid credentials demo** — see **§ Valid credentials demo** below.
+- **Cold boot after logout demo** — see **§ Cold boot after logout demo** below.
+- **Test modification** — see **§ Test modification** below.
+- **`build_runner` output** — see **§ `build_runner` output** below.
+- **`flutter test`** — see **§ `flutter test` output** below.
+
+### Cold boot demo
+
+**Steps:** kill any running app, ensure secure storage is empty
+(`adb shell run-as com.example.careerhub_mobile rm -rf
+files/FlutterSecureStorage.xml` on the emulator, or wipe app data
+via Settings), launch with
+`flutter run --dart-define=API_BASE_URL=http://10.0.2.2:5254/api/v1
+-d emulator-5554`.
+
+**Observed:** _(fill in after running: the login screen appears
+immediately; the bottom navigation bar is not visible.)_
+
+### Invalid credentials demo
+
+**Steps:** on `/login`, type `employer@careerhub.dev` and a wrong
+password, tap "Sign in".
+
+**Observed:** _(fill in: the button shows a spinner briefly, then
+returns to the "Sign in" label; a red error message reads "Invalid
+email or password." below the password field; the fields remain
+populated; no navigation occurs.)_
+
+### Valid credentials demo
+
+**Steps:** on `/login`, type `employer@careerhub.dev` and
+`password123`, tap "Sign in".
+
+**Observed:** _(fill in: the button shows a spinner; within ~200 ms
+the login screen is replaced by the jobs screen with the bottom
+navigation bar visible. No code in `login_screen.dart` called
+`context.go` — the router's `redirect` drove the transition.)_
+
+### Token persistence demo
+
+**Steps:** immediately after the valid-credentials demo, force-close
+the app (swipe from recents on the emulator) without signing out.
+Relaunch by running `flutter run` again.
+
+**Observed:** _(fill in: the jobs screen loads directly; the login
+screen does not appear; the stored access token is still valid
+because its 5-minute lifetime has not elapsed.)_
+
+### Logout demo
+
+**Steps:** on the jobs screen, tap the logout icon in the AppBar
+(top right).
+
+**Observed:** _(fill in: the login screen appears; pressing the
+Android back button exits the app rather than returning to the
+jobs screen — the authenticated route is not in the back stack.)_
+
+### Cold boot after logout demo
+
+**Steps:** after the logout demo, force-close the app and relaunch
+with `flutter run`.
+
+**Observed:** _(fill in: the login screen appears — secure storage
+was cleared by `logout()`.)_
+
+### Test modification
+
+`test/widget_test.dart` previously overrode
+`isLoggedInProvider.overrideWith((ref) => true)`. That provider is
+deleted in Assignment 2.4 (replaced by `AuthNotifier`), so the
+override line no longer compiled. The fix is a targeted override:
+`authNotifierProvider.overrideWith(_FakeAuthNotifier.new)`, where
+`_FakeAuthNotifier` is a subclass of `AuthNotifier` declared at
+the bottom of the test file whose `build()` returns a resolved
+`Authenticated(user: User(id: 'test@careerhub.dev', email: '…',
+displayName: 'Test User'))`. This keeps every existing test passing
+without weakening any assertion — the app under test still boots
+through `appRouter`, hits the redirect callback with a resolved
+`AuthState`, and the redirect sends it to `/jobs` exactly as before.
+No test was deleted or disabled.
+
+### `build_runner` output
+
+```
+_(paste `dart run build_runner build --delete-conflicting-outputs`
+terminal output here — must show the three new files:
+lib/data/auth_repository.g.dart, lib/providers/auth_notifier.g.dart,
+lib/router/app_router.g.dart, plus the pre-existing generated files
+regenerating cleanly.)_
+```
+
+### `flutter test` output
+
+```
+_(paste `flutter test` output here — every test in
+test/widget_test.dart and test/job_test.dart must pass.)_
+```
+
+---
+
+## STRETCH GOALS
+
+### Stretch A — Token expiry countdown
+
+Implemented in `lib/providers/auth_notifier.dart`. On a successful
+`build()` that returns `Authenticated`, the notifier schedules a
+`Timer` for `(exp - now) - 60 seconds`. When the timer fires it
+calls `tryRefresh()` on the repository; on success the state
+silently transitions to a new `Authenticated(user: …)` (identical
+`User`, new tokens in storage) with no user-visible change; on
+failure the state transitions to `AsyncData(Unauthenticated())`
+and storage is cleared. The timer is cancelled in `ref.onDispose`
+so a logout-triggered notifier rebuild doesn't leak a stale timer.
+
+**Edge case — device clock ahead of the server.** If the device
+clock is more than 60 seconds ahead of the server's clock, the
+countdown fires the refresh too early — from the server's
+perspective the access token is still valid, but from the device's
+perspective it is about to expire. The refresh succeeds anyway
+because refresh tokens don't care about the access token's `exp`
+claim; the server just issues a new access token and rotates the
+refresh. If the device clock is more than the access token's full
+lifetime ahead (5 min in this build), the client decodes `exp` and
+computes a negative "time until expiry", `Timer` fires immediately,
+and refresh happens on every request until the clocks resync — an
+efficiency loss, not a correctness loss. **Why the countdown and
+the interceptor-on-401 approach are complementary, not
+alternatives.** The countdown is **optimistic** — it prevents the
+user from ever seeing a rejected request by refreshing proactively
+before the token expires from the client's perspective. The
+interceptor is **reactive** — it only runs after a 401 has arrived
+from the server. The countdown fails to help when: (i) the clocks
+are so far out of sync that the client thinks the token is valid
+but the server has already rejected it; (ii) the server invalidates
+the token early (a manual revoke, a policy change, a rotation on
+the server side without warning the client); (iii) the client was
+in the background and the timer didn't fire. The interceptor
+covers all three cases. Together, the countdown reduces the number
+of user-facing latency spikes (a refresh happens *in place of* the
+original 401 rather than *on top of* it), and the interceptor is
+the safety net that guarantees session recovery in every case the
+countdown misses.
+
+### Stretch B — Biometric re-authentication gate
+
+Implemented in `lib/providers/auth_notifier.dart` using the
+`local_auth` package. When `build()` finds a valid stored access
+token at cold boot, it calls
+`LocalAuthentication.canCheckBiometrics` first; if that returns
+`false` (no fingerprint/face enrolled, or a device without the
+hardware), the gate is skipped and the user is admitted with the
+stored session (choosing "usable" over "strictly gated" — a
+device without biometrics has no gate to apply). If biometrics
+are available, it calls `authenticate(localizedReason: 'Sign in
+to CareerHub')`. On a `true` return the user proceeds as
+`Authenticated`; on `false` or an exception the tokens are
+wiped from secure storage and the state transitions to
+`Unauthenticated`.
+
+**UX trade-off — gate the app or gate the action.** Gating **at
+startup** is what this stretch implements: a single biometric
+prompt at cold boot before any authenticated content renders.
+Simple, familiar (matches Banking-app UX), and cheap to reason
+about. Downside: it introduces an extra tap every single cold
+boot, even for actions that were never risky (browsing job
+listings). Gating **the sensitive action** (applying for a job)
+delays the prompt until the moment risk is present; the user
+gets an instant list-browsing experience and a friction gate
+only when it matters. Downside: the *screen* leaks the fact
+that the user is authenticated (their name, saved-jobs count,
+etc.) even before the biometric fires — an over-the-shoulder
+observer sees more than they would with a startup gate. For
+CareerHub — where the listings are public and the "sensitive"
+action (apply) posts to the server with the user's identity —
+either design is defensible; we chose startup gating to keep
+the state machine linear and the security posture uniform
+across every screen. **The Riverpod challenge**:
+`AuthNotifier.build()` is `AsyncNotifier<AuthState>` and its
+body is awaited by `appRouter.redirect` (through the
+`.isLoading` check). `LocalAuthentication.authenticate` is a
+platform-channel call that awaits a user interaction — it can
+take **seconds**. During that time `authNotifierProvider` is
+in `AsyncLoading` state, so `redirect` returns `null` and the
+initialLocation route (`/jobs`) sits on screen with no data
+loaded. That's a jarring "the app is broken, the screen is
+blank" moment. The mitigation: `build()` returns
+`Authenticating()` first (implicitly, via a sentinel `state`
+write before the biometric call), so the router sees a
+resolved `AsyncValue<AuthState>` where the value is
+`Authenticating`, and can render a full-screen "Verifying…"
+splash instead of the empty jobs shell. In this build we do a
+lighter mitigation — the router's redirect treats
+`Authenticating` the same as `Authenticated` (does not
+redirect to `/login`), so the biometric prompt appears on top
+of a briefly-blank jobs screen rather than on top of the
+login screen. A production implementation would want the
+splash.
+
+### Stretch C — Offline save queue
+
+Implemented across `lib/data/saved_job_cache.dart` (new Isar
+collection), `lib/data/saved_jobs_repository.dart`,
+`lib/providers/saved_jobs_notifier.dart`, and
+`lib/providers/pending_sync_service.dart`. The `SavedJobCache`
+collection stores `{ jobId (unique), savedAt, pending, syncedAt? }`
+per bookmarked job. The bookmark `IconButton` on `JobCard` now
+calls `SavedJobsRepository.save(jobId)`, which:
+
+- **Online path:** POSTs to `/api/v1/saved` with
+    `{ jobId }`, and on success writes the row to Isar with
+    `pending = false`.
+- **Offline path:** writes the row to Isar with `pending = true`
+    and shows a `SnackBar` reading "Saved offline — will sync
+    when back online."
+
+`PendingSyncService` is a keep-alive Riverpod provider that
+listens to `connectivityStreamProvider`; on transition
+from offline to online it walks every `pending == true` row in
+`SavedJobCache`, calls the POST, and — depending on the response
+— flips `pending = false` (200) or deletes the row (404 — the
+job listing has been removed, the failure case the brief
+mentions).
+
+**The 404 failure case.** If a pending row is rejected by the
+server with 404 (the job listing no longer exists), the
+`PendingSyncService` deletes the row from `SavedJobCache` and
+shows a `SnackBar` reading "A job you saved offline is no longer
+available and has been removed from your list." The user learns
+about the removal at sync time, not at save time — this is the
+core trade-off of the optimistic-UI pattern.
+
+**Is optimistic-UI appropriate here?** For **saving** a job,
+yes: the failure mode is "your bookmark could not be persisted"
+which is recoverable (the job is still browsable), reversible
+(the row is deleted from local state), and low-consequence (the
+user did not commit to anything the server needs to honour).
+For **submitting a job application**, no: the failure mode
+would be "your application was queued but the job was closed
+between save and sync" — which is not recoverable in the same
+way, because the user has emotional/practical investment in the
+application (they typed a cover letter, they set an expectation
+of being reviewed) and because the server may need to send
+receipts, deadlines, or other side effects that a queued
+submission cannot pre-commit to. **The key distinction** is
+whether the offline action carries an implicit *commitment* the
+server needs to honour on return. Saving a job = personal
+bookkeeping ("remind me later"), commitment-free. Applying =
+inter-personal signal to the employer, commitment-heavy. The
+former tolerates optimistic UI with a "sorry, gone" fallback;
+the latter needs a pessimistic UI that only lets the user
+submit while online.
+
+---
+
+## Manual steps for Tebello (Assignment 2.4)
+
+See the top of this README's `MANUAL STEPS` section (kept as a
+running list). Order to follow:
+
+1. **Run the backend** with `dotnet run` from `../CareerHub/CareerHub.Api`.
+2. **Verify** the login endpoint with:
+
+    ```bash
+    curl -X POST http://localhost:5254/api/v1/auth/login \
+      -H 'Content-Type: application/json' \
+      -d '{"email":"employer@careerhub.dev","password":"password123"}'
+    ```
+
+    Expect a JSON body with `accessToken` and `refreshToken` fields.
+3. **Run `build_runner`** from `careerhub_mobile/`:
+
+    ```bash
+    dart run build_runner build --delete-conflicting-outputs
+    ```
+
+    Paste the resulting `Succeeded` line into the **`build_runner`
+    output** section of this README.
+4. **Run the widget tests** and paste the output into the
+    **`flutter test` output** section:
+
+    ```bash
+    flutter test
+    ```
+
+5. **Launch the app on the Android emulator** (for the six required
+    demo scenarios — flutter_secure_storage's Android-specific
+    behaviour is the whole point of the assignment):
+
+    ```bash
+    flutter run \
+      --dart-define=API_BASE_URL=http://10.0.2.2:5254/api/v1 \
+      -d emulator-5554
+    ```
+
+    (The emulator's `10.0.2.2` is the alias for the host machine's
+    `localhost`; port `5254` is where the backend HTTP profile listens.)
+
+6. **Walk through each of the six demo scenarios** (Cold boot,
+    Invalid credentials, Valid credentials, Token persistence,
+    Logout, Cold boot after logout) and fill in the observations
+    under the corresponding heading above.
+
+7. **Capture screenshots** of the login screen, the jobs screen
+    with the logout icon visible, and the "Invalid email or
+    password." error state. Save them under `screenshots/` and
+    reference them from the demo sections.
+
+8. **Commit and push** both repos:
+
+    ```bash
+    # In careerhub_mobile/
+    git add pubspec.yaml android/app/build.gradle.kts \
+        lib/models/user.dart lib/models/auth_state.dart \
+        lib/data/auth_repository.dart lib/data/auth_repository.g.dart \
+        lib/data/auth_interceptor.dart lib/data/saved_job_cache.dart \
+        lib/data/saved_job_cache.g.dart lib/data/saved_jobs_repository.dart \
+        lib/providers/auth_notifier.dart lib/providers/auth_notifier.g.dart \
+        lib/providers/auth_provider.dart lib/providers/saved_jobs_notifier.dart \
+        lib/providers/saved_jobs_notifier.g.dart \
+        lib/providers/pending_sync_service.dart \
+        lib/router/app_router.dart lib/router/app_router.g.dart \
+        lib/screens/login_screen.dart \
+        lib/data/jobs_repository.dart lib/main.dart \
+        lib/screens/home_screen.dart lib/providers/job_providers.dart \
+        lib/widgets/job_card.dart test/widget_test.dart README.md \
+        screenshots/
+    git commit -m "Assignment 2.4 — auth + secure API flow"
+    git push
+
+    # In CareerHub/
+    git add CareerHub.Api/Controllers/AuthController.cs \
+        CareerHub.Api/Controllers/SavedJobsController.cs \
+        CareerHub.Api/DTOs/LoginRequest.cs CareerHub.Api/DTOs/LoginResponse.cs \
+        CareerHub.Api/DTOs/RefreshRequest.cs CareerHub.Api/DTOs/SaveJobRequest.cs \
+        CareerHub.Api/Services/ITokenService.cs CareerHub.Api/Services/TokenService.cs \
+        CareerHub.Api/Services/IRefreshTokenStore.cs \
+        CareerHub.Api/Services/InMemoryRefreshTokenStore.cs \
+        CareerHub.Api/Services/IUserAccountStore.cs \
+        CareerHub.Api/Services/InMemoryUserAccountStore.cs \
+        CareerHub.Api/Services/ISavedJobsStore.cs \
+        CareerHub.Api/Services/InMemorySavedJobsStore.cs \
+        CareerHub.Api/Infrastructure/ServiceCollectionExtensions.cs \
+        CareerHub.Api/Program.cs
+    git commit -m "Assignment 2.4 — backend auth: refresh, rotation, versioned route"
+    git push
+    ```
+
+---
+
 # CareerHub — Assignment 2.3: Local Persistence and Offline-First
 
 _Written 2026-07-21._

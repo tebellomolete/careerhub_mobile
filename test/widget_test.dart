@@ -4,7 +4,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:careerhub_mobile/core/prefs_provider.dart';
 import 'package:careerhub_mobile/main.dart';
+import 'package:careerhub_mobile/models/auth_state.dart';
 import 'package:careerhub_mobile/models/job.dart';
+import 'package:careerhub_mobile/models/user.dart';
+import 'package:careerhub_mobile/providers/auth_notifier.dart';
 import 'package:careerhub_mobile/providers/filter_notifier.dart';
 import 'package:careerhub_mobile/providers/job_providers.dart';
 import 'package:careerhub_mobile/providers/jobs_notifier.dart';
@@ -142,7 +145,14 @@ Widget bootApp() {
       // ([filteredJobsProvider], [visibleJobsProvider],
       // [savedJobsProvider]) still runs unchanged. See README, Q4.
       jobsProvider.overrideWith(_FakeJobsNotifier.new),
-      isLoggedInProvider.overrideWith((ref) => true),
+      // Assignment 2.4, Step 9.5 — the previous
+      // `isLoggedInProvider.overrideWith((ref) => true)` line was
+      // deleted along with `isLoggedInProvider` itself. Replaced
+      // with a fake AuthNotifier whose `build()` returns
+      // `Authenticated` synchronously so the router's redirect
+      // sends the boot to `/jobs` (matches the previous test
+      // behaviour). See README 2.4, § Test modification.
+      authProvider.overrideWith(_FakeAuthNotifier.new),
       prefsProvider.overrideWithValue(_testPrefs),
     ],
     child: const CareerHubApp(),
@@ -677,4 +687,37 @@ void main() {
       expect(find.text('Open'), findsOneWidget);
     });
   });
+}
+
+/// Assignment 2.4, Step 9.5 — the fake AuthNotifier the test
+/// suite overrides `authProvider` with.
+///
+/// `build()` returns a resolved `Authenticated` synchronously
+/// so the router's redirect callback (which returns null while
+/// the AsyncValue is loading and otherwise checks whether the
+/// resolved AuthState is `Authenticated`) immediately allows
+/// the app to render `/jobs`. Nothing in the widget test drives
+/// login/logout, so those methods are inherited unchanged from
+/// the real `AuthNotifier` (they would never actually run
+/// because `_FakeJobsNotifier` handles the data path).
+///
+/// `skipBiometricGate` is flipped to `true` so the Stretch B
+/// biometric prompt doesn't attempt to open a platform channel
+/// during a widget test (there's no host activity in `flutter
+/// test`, so the plugin would throw).
+class _FakeAuthNotifier extends AuthNotifier {
+  _FakeAuthNotifier() {
+    skipBiometricGate = true;
+  }
+
+  @override
+  Future<AuthState> build() async {
+    return const Authenticated(
+      user: User(
+        id: 'test@careerhub.dev',
+        email: 'test@careerhub.dev',
+        displayName: 'Test User',
+      ),
+    );
+  }
 }
