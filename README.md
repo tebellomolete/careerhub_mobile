@@ -28,7 +28,7 @@ Flutter's `Element.update` path is taken rather than
 `RenderObject.updateWith(new widget)`, which — for most render objects
 — compares each configurable property and only marks the render object
 for layout (`markNeedsLayout`) or paint (`markNeedsPaint`) if a
-property actually changed. If the new widget carries the same values,
+property  actually changed. If the new widget carries the same values,
 the render object is neither re-laid-out nor re-painted; the frame
 reuses the previous layout and raster output. Contrast with a new
 widget of a **different** `runtimeType`: `Element.update` returns
