@@ -997,15 +997,17 @@ Triggers on `push` and `pull_request` against `main`. Steps:
 2. `subosito/flutter-action@v2` — pin Flutter 3.44.5, stable
    channel, enable pub-cache caching.
 3. `flutter pub get` — resolve dependencies from `pubspec.lock`.
-4. `flutter analyze` — analyzer gate; the workflow fails on any
-   error. Deliberately NOT `--fatal-infos --fatal-warnings` —
-   the codebase carries 22 pre-existing infos/warnings from
-   earlier assignments (isar_generator's `experimental_member_use`,
-   `prefer_initializing_formals` on older repos,
-   `unintended_html_in_doc_comment`); none are from 3.2 and
-   repairing them is out of scope for this workflow. The brief
-   specifies "fail the workflow if any errors are reported" —
-   errors only, which matches the default.
+4. `flutter analyze --no-fatal-infos --no-fatal-warnings` —
+   analyzer gate; the workflow fails on errors only. **Note:**
+   plain `flutter analyze` is deceptively strict — it exits 1
+   on info- and warning-level lints too, not just errors. The
+   `--no-fatal-*` flags are required to actually get
+   errors-only behaviour. The codebase carries 22 pre-existing
+   infos/warnings from earlier assignments (isar_generator's
+   `experimental_member_use`, `prefer_initializing_formals` on
+   older repos, `unintended_html_in_doc_comment`); none are
+   from 3.2 and repairing them is out of scope for this
+   workflow.
 5. `flutter test test/unit test/widget --coverage` — runs the
    Assignment 3.2 suite (unit + widget layers of the three-layer
    pyramid) and writes `coverage/lcov.info`. Deliberately

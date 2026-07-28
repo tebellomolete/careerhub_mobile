@@ -41,18 +41,25 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # `flutter analyze` returns a non-zero exit code on any error.
-      # Deliberately NOT `--fatal-infos --fatal-warnings` — the
-      # codebase carries 22 pre-existing infos and warnings from
+      # `flutter analyze` DEFAULTS to `--fatal-infos --fatal-warnings`
+      # — an empirically-verified surprise. `flutter analyze --help`
+      # shows both flags as `--[no-]fatal-...` with no default listed,
+      # and a plain `flutter analyze` still exits 1 when only info-
+      # or warning-level lints are present (`22 issues found` on our
+      # workspace returns exit code 1 even without either flag). To
+      # actually get errors-only behaviour we must pass BOTH
+      # `--no-fatal-infos` and `--no-fatal-warnings` explicitly.
+      #
+      # The codebase carries 22 pre-existing infos and warnings from
       # earlier assignments (isar_generator's `experimental_member_use`
       # on the emitted `.g.dart` files, `prefer_initializing_formals`
       # on the older repositories, `unintended_html_in_doc_comment`
       # on a few docstrings). None of these are from Assignment 3.2,
-      # and repairing them is out of scope for this workflow.
-      # The brief specifies "fail the workflow if any errors are
-      # reported" — errors only, which matches the default.
+      # and repairing them is out of scope for this workflow. The
+      # brief specifies "fail the workflow if any errors are
+      # reported" — errors only.
       - name: Analyze
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       # `flutter test test/unit test/widget --coverage` runs the
       # Assignment 3.2 suite (three-layer test pyramid: unit +
