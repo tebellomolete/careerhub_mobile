@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
+import '../config/app_config.dart';
 import '../models/user.dart';
 import 'api_result.dart';
 
@@ -28,18 +29,12 @@ part 'auth_repository.g.dart';
 const String kAccessTokenStorageKey = 'careerhub.auth.access_token';
 const String kRefreshTokenStorageKey = 'careerhub.auth.refresh_token';
 
-// Assignment 2.4 — the base URL for the plain (interceptor-free)
-// Dio the AuthRepository owns. Read with `String.fromEnvironment`
-// so the value is compile-time constant folded to the same value
-// `dioProvider` uses in `jobs_repository.dart`. Kept as a
-// re-declaration here (rather than an import) so this file does
-// NOT depend on `jobs_repository.dart` — that dependency direction
-// would produce a cycle (jobs_repository imports auth_interceptor
-// which shares its keys with THIS file).
-const String _authBaseUrl = String.fromEnvironment(
-  'API_BASE_URL',
-  defaultValue: 'http://localhost:5254/api/v1',
-);
+// Assignment 3.3, Part 2.5 — the base URL for the plain
+// (interceptor-free) Dio the AuthRepository owns now reads from
+// `AppConfig.apiBaseUrl` for consistency with `dioProvider` in
+// `jobs_repository.dart`. Both resolve at compile time from the
+// same `API_BASE_URL` key inside `config.{env}.json`, so login
+// and refresh calls hit the same host as every other request.
 
 // Assignment 2.4 — the auth endpoint suffixes. Kept as constants
 // so the interceptor's refresh-endpoint guard (Case 2) can match
@@ -65,7 +60,7 @@ const String kRefreshPath = '/auth/refresh';
 AuthRepository authRepository(Ref ref) {
   final dio = Dio(
     BaseOptions(
-      baseUrl: _authBaseUrl,
+      baseUrl: AppConfig.apiBaseUrl,
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(seconds: 15),
       headers: const {'Accept': 'application/json'},

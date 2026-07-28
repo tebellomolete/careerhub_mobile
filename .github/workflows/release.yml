@@ -1,0 +1,123 @@
+# Assignment 3.3, Part 3 — the release pipeline.
+#
+# This workflow is a RELEASE PIPELINE, not a quality gate. It runs on
+# push to `main` only (no pull_request trigger) — the sibling
+# `flutter_test.yml` from Assignment 3.2 already runs analyze + tests
+# on every PR, so this workflow can trust that the `main` HEAD it
+# receives has already passed that gate. It repeats analyze + tests
+# in-line so a direct push to main (a merge commit, a hotfix) still
+# fails-fast before spending the build minutes on an appbundle, and
+# so the release artifact is only produced from code that just passed
+# the same checks the PR gate uses.
+#
+# The two `--dart-define-from-file` files (`config.dev.json` for
+# tests, `config.prod.json` for the appbundle) are NEVER committed —
+# see `.gitignore`. Both are materialised at workflow-run time from
+# GitHub Actions secrets (`CONFIG_DEV_JSON`, `CONFIG_PROD_JSON`),
+# which is the CI-side counterpart of the developer's laptop-local
+# copy of the same files.
+#
+# What this workflow does NOT do: sign the AAB. The uploaded artifact
+# is an UNSIGNED release App Bundle — Google Play requires a signed
+# AAB. Signing is documented as the next step under
+# "Release Pipeline signing gap" in README.md; implementing it
+# requires storing the keystore + credentials as additional GitHub
+# Actions secrets and wiring them into `android/app/build.gradle.kts`.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    name: Build unsigned release App Bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Pinned to the same Flutter version `flutter_test.yml` uses,
+      # so the release build resolves against the exact package
+      # graph the quality-gate workflow tested against.
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.5'
+          channel: stable
+          cache: true
+
+      # `flutter pub get` restores dependencies from pubspec.lock,
+      # so CI resolves the exact same package versions the local
+      # dev environment used.
+      - name: Install dependencies
+        working-directory: careerhub_mobile
+        run: flutter pub get
+
+      # Assignment 3.3, Part 3 Step 3.2 (fourth step) — materialise
+      # the production config from the CONFIG_PROD_JSON secret. The
+      # secret's contents are written verbatim to config.prod.json
+      # inside the project. `printf %s` (not `echo`) preserves the
+      # JSON exactly without appending a trailing newline that could
+      # break a strict JSON parser.
+      - name: Write config.prod.json from secret
+        working-directory: careerhub_mobile
+        env:
+          CONFIG_PROD_JSON: ${{ secrets.CONFIG_PROD_JSON }}
+        run: printf '%s' "$CONFIG_PROD_JSON" > config.prod.json
+
+      # Assignment 3.3, Part 3 Step 3.2 (sixth step, part 1) —
+      # materialise the dev config from CONFIG_DEV_JSON. Tests run
+      # against the dev config so they never accidentally touch the
+      # production API URL (see README 3.3 Q1's second bullet on the
+      # QA-runs-against-prod accident).
+      - name: Write config.dev.json from secret
+        working-directory: careerhub_mobile
+        env:
+          CONFIG_DEV_JSON: ${{ secrets.CONFIG_DEV_JSON }}
+        run: printf '%s' "$CONFIG_DEV_JSON" > config.dev.json
+
+      # `flutter analyze` DEFAULTS to `--fatal-infos --fatal-warnings`,
+      # a surprise documented in `flutter_test.yml`. This workflow
+      # inherits the same "errors only" behaviour so the pre-existing
+      # 22 infos/warnings (from earlier assignments' generated files
+      # and doc-comment quirks) do not block a release cut.
+      - name: Analyze
+        working-directory: careerhub_mobile
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      # Assignment 3.3, Part 3 Step 3.2 (sixth step, part 2) — run
+      # the Assignment 3.2 unit+widget pyramid against the dev
+      # config. `test/widget_test.dart` and `integration_test/` are
+      # excluded for the same reasons `flutter_test.yml` excludes
+      # them.
+      - name: Run unit and widget tests (dev config)
+        working-directory: careerhub_mobile
+        run: |
+          flutter test test/unit test/widget \
+            --dart-define-from-file=config.dev.json
+
+      # Assignment 3.3, Part 3 Step 3.2 (seventh step) — build the
+      # release App Bundle with the production config. `--release`
+      # emits an AOT-compiled AAB; the compile-time
+      # `AppConfig.apiBaseUrl` constant folds to the production URL
+      # from `config.prod.json` at this step.
+      - name: Build release App Bundle
+        working-directory: careerhub_mobile
+        run: |
+          flutter build appbundle --release \
+            --dart-define-from-file=config.prod.json
+
+      # Assignment 3.3, Part 3 Step 3.2 (eighth step) — upload the
+      # unsigned AAB as a workflow artifact with a 30-day retention
+      # so it can be downloaded, signed offline, and uploaded to
+      # Google Play. Path is relative to the repo root; the
+      # `working-directory` above does not apply to the upload-artifact
+      # action.
+      - name: Upload release App Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-aab
+          path: careerhub_mobile/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 30

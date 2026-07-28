@@ -4,6 +4,7 @@ import 'package:isar_community/isar.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../config/app_config.dart';
 import '../core/isar_provider.dart';
 import '../core/prefs_provider.dart';
 import '../models/job.dart';
@@ -20,49 +21,17 @@ import 'job_dto.dart';
 part 'jobs_repository.g.dart';
 
 // ─────────────────────────────────────────────────────────────────────
-// Assignment 2.1 Stretch C — environment-aware base URL.
-//
-// Three compile-time constants, one per environment, each read via
-// `String.fromEnvironment`. `String.fromEnvironment` is a special-case
-// constant expression: the Dart compiler resolves it at BUILD time from
-// the value passed via `--dart-define`, then constant-folds it into
-// the binary. There is NO runtime lookup and NO runtime `if` anywhere
-// in this file.
-//
-// Defaults:
-//   - dev     → localhost on the host machine (matches
-//               launchSettings.json's http profile). This is correct
-//               for Chrome (web) and desktop targets. On an Android
-//               emulator, override to `http://10.0.2.2:5254/api/v1`
-//               via --dart-define since the emulator sandbox aliases
-//               the host's localhost as 10.0.2.2.
-//   - staging → a placeholder; override with --dart-define at build time.
-//   - prod    → a placeholder; override with --dart-define at build time.
+// Assignment 3.3, Part 2.5 — replaced the three per-env constants
+// (`_envDevBaseUrl`, `_envStagingBaseUrl`, `_envProdBaseUrl`) plus
+// the `_envName`-based ternary with a single `AppConfig.apiBaseUrl`
+// lookup. `AppConfig` reads `API_BASE_URL` via `String.fromEnvironment`
+// so the value is still resolved at compile time and still
+// constant-folded into `libapp.so`; the only change is that the
+// `dev`/`prod` selection is now expressed via
+// `--dart-define-from-file=config.{env}.json` rather than three
+// separate `--dart-define` flags. See `lib/config/app_config.dart`
+// and README 3.3 Part 2.
 // ─────────────────────────────────────────────────────────────────────
-const String _envDevBaseUrl = String.fromEnvironment(
-  'API_BASE_URL',
-  defaultValue: 'http://localhost:5254/api/v1',
-);
-const String _envStagingBaseUrl = String.fromEnvironment(
-  'API_BASE_URL_STAGING',
-  defaultValue: 'https://staging.careerhub.example.com/api/v1',
-);
-const String _envProdBaseUrl = String.fromEnvironment(
-  'API_BASE_URL_PROD',
-  defaultValue: 'https://api.careerhub.example.com/api/v1',
-);
-
-/// The environment selector, read once at build time. Values: `dev`,
-/// `staging`, `prod`. Anything else falls back to `dev`.
-const String _envName = String.fromEnvironment('ENV', defaultValue: 'dev');
-
-/// A single `const` picked at build time. Because every branch of this
-/// expression is itself a compile-time constant, the Dart compiler folds
-/// the whole thing down to one string literal in the compiled binary and
-/// tree-shakes the other two URLs out entirely.
-const String _resolvedBaseUrl = _envName == 'prod'
-    ? _envProdBaseUrl
-    : (_envName == 'staging' ? _envStagingBaseUrl : _envDevBaseUrl);
 
 /// Assignment 2.1 → 2.4 — the configured Dio instance.
 ///
@@ -82,7 +51,10 @@ const String _resolvedBaseUrl = _envName == 'prod'
 Dio dio(Ref ref) {
   final client = Dio(
     BaseOptions(
-      baseUrl: _resolvedBaseUrl,
+      // Assignment 3.3, Part 2.5 — the base URL now flows from
+      // `AppConfig.apiBaseUrl`, which is a compile-time-constant
+      // read from `--dart-define-from-file=config.{env}.json`.
+      baseUrl: AppConfig.apiBaseUrl,
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(seconds: 15),
       headers: const {
@@ -91,21 +63,31 @@ Dio dio(Ref ref) {
     ),
   );
 
-  client.interceptors.add(LogInterceptor(
-    request: true,
-    requestHeader: false,
-    requestBody: false,
-    responseHeader: false,
-    responseBody: false,
-    error: true,
-  ));
+  // Assignment 3.3, Part 2.5 — the LogInterceptor is now gated on
+  // `AppConfig.environment == 'dev'` so a release build (which
+  // compiles with `ENVIRONMENT=prod`) never logs request or
+  // response bodies. Body logging in production would leak PII —
+  // bearer tokens in headers, application form field values,
+  // JobSeeker email addresses — into logcat, which any physical
+  // device with `adb` attached can read without root. See README
+  // 3.3 Part 2.
+  if (AppConfig.environment == 'dev') {
+    client.interceptors.add(LogInterceptor(
+      request: true,
+      requestHeader: false,
+      requestBody: true,
+      responseHeader: false,
+      responseBody: true,
+      error: true,
+    ));
+  }
 
   // Assignment 2.4, Part 9.1 — the retry Dio the AuthInterceptor
   // uses to POST /refresh and to replay the original request. No
   // interceptors, same baseUrl.
   final retryDio = Dio(
     BaseOptions(
-      baseUrl: _resolvedBaseUrl,
+      baseUrl: AppConfig.apiBaseUrl,
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(seconds: 15),
       headers: const {'Accept': 'application/json'},
@@ -286,21 +268,25 @@ class JobsRepository {
 
       return Success(jobs);
     } on DioException catch (e) {
-      // Part 8 — DioException.type is an enum with a small, closed set
-      // of values; a switch expression over it is exhaustive and
-      // produces exactly one message + failure variant per branch. No
-      // if-chain, no fall-through, no `default` swallowing an
-      // unhandled type by accident.
-      final message = _messageForDioException(e);
+      // Assignment 3.3, Part 4.2 — every status code the brief calls
+      // out (401, 404, 503) plus the null-statusCode split by
+      // `DioExceptionType` (connectionError vs the two timeout
+      // variants) resolves to a specific user-facing message here.
+      // 401 additionally carries `statusCode: 401` on the returned
+      // ServerFailure so the notifier layer can match on it (Part
+      // 5) and drive the auto-logout path.
       final statusCode = e.response?.statusCode;
       if (statusCode != null) {
-        // Stretch C — the server DID respond, so this is a
-        // ServerFailure with a concrete (non-null) status code.
-        return ServerFailure(message: message, statusCode: statusCode);
+        return ServerFailure(
+          message: _jobsMessageFor(statusCode),
+          statusCode: statusCode,
+        );
       }
-      // Stretch C — no response received, so classify as a
-      // NetworkFailure (connection could not be established).
-      return NetworkFailure(message);
+      // No HTTP response received. Distinguished by DioExceptionType
+      // so `connectionError` gets a check-your-network message and
+      // the two timeout variants get a try-again-in-a-moment message
+      // (see README 3.3 Q2's fourth bullet).
+      return NetworkFailure(_networkMessageFor(e.type));
     } catch (e) {
       // Anything else (TypeError from a wire-shape mismatch, a
       // StateError, a rogue String? cast) — Stretch C classifies as
@@ -394,37 +380,33 @@ class JobsRepository {
     }
   }
 
-  /// Part 8 — the DioException → human-readable-message translator.
-  /// A switch EXPRESSION on `e.type` so the Dart analyzer verifies
-  /// every enum value is covered (`DioExceptionType` is a small, fixed
-  /// enum). Anything unmatched falls through to the `_` arm with a
-  /// generic message — but every named case is spelled out so the
-  /// intent is inspectable at review time.
-  String _messageForDioException(DioException e) => switch (e.type) {
-        DioExceptionType.connectionTimeout =>
-          'The connection to CareerHub timed out. Check your internet and try again.',
-        DioExceptionType.sendTimeout =>
-          'The request to CareerHub took too long to send. Try again.',
-        DioExceptionType.receiveTimeout =>
-          'CareerHub took too long to respond. Try again in a moment.',
-        DioExceptionType.badCertificate =>
-          'The CareerHub server presented an invalid security certificate.',
-        DioExceptionType.badResponse => switch (e.response?.statusCode) {
-            final int code when code >= 500 =>
-              'CareerHub is having trouble right now (server error $code). Please try again shortly.',
-            final int code when code == 404 =>
-              'Could not find the jobs endpoint on the CareerHub server.',
-            final int code =>
-              'CareerHub returned an unexpected response (status $code).',
-            null =>
-              'CareerHub returned an unexpected response.',
-          },
-        DioExceptionType.cancel => 'The request was cancelled.',
-        DioExceptionType.transformTimeout =>
-          'CareerHub responded, but the response took too long to decode. Try again.',
+  /// Assignment 3.3, Part 4.2 — per-status-code user-facing message
+  /// map for the jobs endpoint. Each branch corresponds to a
+  /// distinct recovery action; 401 tells the user their session is
+  /// over, 404 tells them nothing was found, 503 tells them the
+  /// server is unavailable, and the fallback (any other code) states
+  /// the code so a support ticket can identify the class of error
+  /// without guessing.
+  String _jobsMessageFor(int statusCode) => switch (statusCode) {
+        401 => 'Your session has expired. Please sign in again.',
+        404 => 'No jobs were found.',
+        503 => 'CareerHub is temporarily unavailable. Please try again shortly.',
+        _ => 'CareerHub returned an unexpected response (status $statusCode).',
+      };
+
+  /// Assignment 3.3, Part 4.2 — the null-statusCode branch, split
+  /// by `DioExceptionType`. `connectionError` (DNS failure, TCP RST,
+  /// TLS handshake refused) gets a check-your-network message; the
+  /// three timeout variants get a try-again-in-a-moment message.
+  /// See README 3.3 Q2's fourth bullet.
+  String _networkMessageFor(DioExceptionType type) => switch (type) {
         DioExceptionType.connectionError =>
-          'Could not reach the CareerHub server. Make sure the API is running and try again.',
-        DioExceptionType.unknown =>
-          'Something went wrong while contacting CareerHub. Please try again.',
+          "Couldn't reach CareerHub. Check your internet connection and try again.",
+        DioExceptionType.connectionTimeout ||
+        DioExceptionType.receiveTimeout ||
+        DioExceptionType.sendTimeout =>
+          'The CareerHub server took too long to respond. Try again in a moment.',
+        _ =>
+          "Couldn't reach CareerHub. Check your internet connection and try again.",
       };
 }

@@ -51,6 +51,14 @@ class ScaffoldWithNavBar extends StatelessWidget {
             selectedIcon: Icon(Icons.bookmark),
             label: 'Saved',
           ),
+          // Assignment 3.3 scaffolding — third tab hosts the
+          // /applications screen where SignalR real-time status
+          // updates land (Part 6).
+          NavigationDestination(
+            icon: Icon(Icons.assignment_outlined),
+            selectedIcon: Icon(Icons.assignment),
+            label: 'Applications',
+          ),
         ],
       ),
     );

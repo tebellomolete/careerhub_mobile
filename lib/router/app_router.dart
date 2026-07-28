@@ -5,6 +5,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import '../models/auth_state.dart';
 import '../providers/auth_notifier.dart';
 import '../providers/auth_provider.dart';
+import '../screens/applications_screen.dart';
 import '../screens/apply_screen.dart';
 import '../screens/home_screen.dart';
 import '../screens/job_detail_screen.dart';
@@ -26,6 +27,7 @@ class AppRoutes {
 
   static const String jobs = '/jobs';
   static const String saved = '/saved';
+  static const String applications = '/applications';
   static const String login = '/login';
 
   static String jobDetail(String id) => '$jobs/$id';
@@ -143,6 +145,17 @@ GoRouter appRouter(Ref ref) {
               GoRoute(
                 path: AppRoutes.saved,
                 builder: (context, state) => const SavedScreen(),
+              ),
+            ],
+          ),
+          // Assignment 3.3 scaffolding — the third tab, hosting the
+          // JobSeeker's submitted-applications screen (Part 6.4 wires
+          // the SignalR hub into its build method's first statement).
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: AppRoutes.applications,
+                builder: (context, state) => const ApplicationsScreen(),
               ),
             ],
           ),

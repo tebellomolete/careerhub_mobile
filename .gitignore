@@ -46,3 +46,12 @@ app.*.map.json
 
 # Claude Code personal/local settings
 .claude/settings.local.json
+
+# Assignment 3.3 Part 2 — compile-time environment config files.
+# Both hold per-environment API URLs and feature flags fed into
+# `--dart-define-from-file` at build time. Never committed: dev
+# lives on the developer's laptop, prod lives in a GitHub Actions
+# secret (CONFIG_PROD_JSON) and is materialised only inside the
+# release workflow.
+config.dev.json
+config.prod.json

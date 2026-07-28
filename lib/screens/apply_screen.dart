@@ -6,8 +6,10 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:form_builder_validators/form_builder_validators.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../data/api_result.dart';
 import '../models/auth_state.dart';
 import '../providers/application_drafts_notifier.dart';
+import '../providers/applications_notifier.dart';
 import '../providers/auth_notifier.dart';
 import '../providers/connectivity_provider.dart';
 
@@ -185,12 +187,46 @@ class ApplyScreen extends HookConsumerWidget {
         return;
       }
 
-      // Online path — mock API accepts unconditionally.
+      // Assignment 3.3 — online path. Route through the
+      // ApplicationsNotifier which owns the Part 5 401 pattern.
+      // Payload keys match the backend's SubmitApplicationRequest DTO
+      // shape (applicantName, applicantEmail); the remaining form
+      // fields are sent alongside as the backend accepts them.
+      final notifier = ref.read(applicationsProvider.notifier);
+      final payload = <String, dynamic>{
+        'applicantName': combined['full_name'],
+        'applicantEmail': combined['email'],
+        'yearsExperience': int.tryParse('${combined['years_experience']}'),
+        'startDate': (combined['start_date'] as DateTime?)?.toIso8601String(),
+        'coverLetter': combined['cover_letter'],
+        'portfolioUrl': combined['portfolio_url'],
+        'termsAccepted': combined['terms'],
+      };
+      final result = await notifier.submit(jobId, payload);
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Application submitted!')),
-      );
-      Navigator.of(context).pop();
+
+      switch (result) {
+        case Success<void>():
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Application submitted!')),
+          );
+          Navigator.of(context).pop();
+        case ServerFailure(:final message):
+          // Includes 409 duplicate and 422 closed listing — the
+          // repository has already mapped these to the exact
+          // user-facing strings from the brief.
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(message)),
+          );
+        case NetworkFailure(:final message):
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(message)),
+          );
+        case UnknownFailure(:final message):
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(message)),
+          );
+      }
     }
 
     return Scaffold(

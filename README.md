@@ -393,6 +393,802 @@ STEPS at the bottom of this section.
 
 ---
 
+## PART 3 — Release Pipeline (Assignment 3.3)
+
+**File.** `careerhub_mobile/.github/workflows/release.yml`.
+
+**Trigger.** `push` to `main` only. No `pull_request:` block — the
+sibling `flutter_test.yml` from Assignment 3.2 already gates every
+PR. The release workflow trusts that gate and repeats analyze +
+tests inline so a direct push (a merge commit landed via the CLI, a
+hotfix cherry-picked to main, a rebase-and-push through the GitHub
+web UI) still fails-fast before spending build minutes on an AAB.
+
+**Step order.**
+
+1. `actions/checkout@v4` — pull the code.
+2. `subosito/flutter-action@v2` at `flutter-version: '3.44.5'`,
+   `channel: stable`, `cache: true` — same pin as the test workflow
+   so the release resolves against the same package graph.
+3. `flutter pub get` (in `careerhub_mobile/`) — restore dependencies
+   from `pubspec.lock`.
+4. Write `config.prod.json` from the `CONFIG_PROD_JSON` GitHub
+   Actions secret (`printf '%s' > config.prod.json` — no trailing
+   newline).
+5. Write `config.dev.json` from `CONFIG_DEV_JSON` for the test step.
+6. `flutter analyze --no-fatal-infos --no-fatal-warnings` — errors
+   only, per the reasoning documented in `flutter_test.yml`.
+7. `flutter test test/unit test/widget
+   --dart-define-from-file=config.dev.json` — the 3.2 pyramid runs
+   against the dev config so tests never touch the production URL.
+8. `flutter build appbundle --release
+   --dart-define-from-file=config.prod.json` — the release AAB
+   compiled with `AppConfig.apiBaseUrl` constant-folded from
+   `config.prod.json`.
+9. `actions/upload-artifact@v4` — upload
+   `build/app/outputs/bundle/release/app-release.aab` as
+   `android-release-aab` with a 30-day retention.
+
+**Signing gap (Step 3.3).** The artifact this workflow produces is
+**unsigned**. Google Play refuses unsigned AABs — they are rejected at
+upload time. To close the gap, two GitHub Actions secrets must be
+added and consumed inside `android/app/build.gradle.kts`:
+
+- **`ANDROID_KEYSTORE_BASE64`** — the release keystore file
+  (`upload-keystore.jks`, generated once with `keytool -genkey -v
+  -keystore upload-keystore.jks -keyalg RSA -keysize 2048 -validity
+  10000 -alias upload`) encoded to a single-line base64 string via
+  `base64 -w0 upload-keystore.jks`. This is the **key material**
+  itself; a leak of this secret means anyone can sign updates that
+  Google Play will accept as coming from your app.
+- **`ANDROID_KEYSTORE_CREDENTIALS`** — a JSON blob containing
+  `storePassword`, `keyPassword`, and `keyAlias`. Kept as a single
+  secret rather than three individual secrets so the reveal-and-audit
+  surface is smaller — three-value alignment errors between the
+  keystore's actual alias and the workflow's `keyAlias` variable are
+  a common CI-breakage class this consolidation prevents.
+
+The workflow decodes the keystore back to a file at build time
+(`echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks`)
+and writes a `key.properties` file from the credentials JSON before
+the `flutter build appbundle` step. `android/app/build.gradle.kts`
+consumes both via a `signingConfigs.release { ... }` block that reads
+`key.properties` and points `storeFile` at
+`android/app/upload-keystore.jks`. The Kotlin DSL shape:
+
+```kotlin
+val keystoreProperties = Properties().apply {
+    val keystorePropertiesFile = rootProject.file("../key.properties")
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+
+android {
+    signingConfigs {
+        create("release") {
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["storePassword"] as String
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["keyPassword"] as String
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+        }
+    }
+}
+```
+
+Implementing the signing wire-up is out of scope for Assignment 3.3
+— the brief explicitly documents this as the "next step after this
+assignment."
+
+**If the repo is not connected to GitHub** at the point Assignment
+3.3 is submitted, both workflows have been confirmed to pass locally
+by running `flutter analyze --no-fatal-infos --no-fatal-warnings`
+and `flutter test test/unit test/widget
+--dart-define-from-file=config.dev.json` from the `careerhub_mobile/`
+directory. The release build step (`flutter build appbundle
+--release --dart-define-from-file=config.prod.json`) is documented
+under MANUAL STEPS below because it emits a device-specific artifact
+outside CI's remit.
+
+---
+
+## PART 4 — HTTP status code mapping (Assignment 3.3)
+
+**Files.**
+- `lib/data/jobs_repository.dart` — `getJobs()`'s `on DioException`
+  block replaced. The catch now branches on `statusCode != null`: on
+  a non-null status code the mapping goes through `_jobsMessageFor`
+  (401 → session expired, 404 → no jobs found, 503 → temporarily
+  unavailable, fallback → "returned an unexpected response (status
+  N)"). On a null status code the message goes through
+  `_networkMessageFor`, split by `DioExceptionType.connectionError`
+  ("check your internet") vs the three timeout variants ("try again in
+  a moment"). The pre-existing `_messageForDioException` switch was
+  removed as unused.
+- `lib/data/applications_repository.dart` — new file, landed with the
+  Part 4 mapping in place. `submitApplication`'s catch maps 400
+  ("problem with your application"), 401 ("session expired" — carries
+  `statusCode: 401` so the notifier can 401-logout), 409 (**exact
+  string:** `'You have already applied for this position.'`), 422
+  (**exact string:** `'This listing is no longer accepting
+  applications.'`), 503 (temporarily unavailable). `getApplications`'s
+  catch maps 401, 404, 503 with endpoint-specific text.
+
+**Which codes now have specific messages vs the previous generic
+handler.** Previously the `on DioException` block in
+`jobs_repository.dart` returned a single-string message per
+`DioExceptionType`. `badResponse` fell through to a nested switch on
+the status code that only distinguished 5xx and 404, so 401 and 503
+both rendered as "returned an unexpected response (status N)".
+Post-3.3, 401, 404, and 503 have specific user-facing messages and
+the 401 case carries `statusCode: 401` on the returned `ServerFailure`
+so the notifier layer can pattern-match on it (Part 5).
+
+**Backend divergences documented in the mapping.** The Flutter
+mapping is aspirational for two codes on today's backend:
+
+- **`422` on submit closed listing.** The backend returns `400` via
+  `ListingClosedException → Status400BadRequest` (see
+  `CareerHub.Api/Middleware/GlobalExceptionHandler.cs` line 28). The
+  `422` branch of `_submitApplicationMessageFor` therefore does not
+  fire against the running API today; the correct fix on the backend
+  is to change the switch expression in `GlobalExceptionHandler` from
+  `ListingClosedException => Status400BadRequest` to `=>
+  Status422UnprocessableEntity`. The Flutter side ships the 422
+  mapping unchanged so the moment that backend change lands, the
+  user-facing string is already correct.
+- **`409` on duplicate application** — this DOES fire today. The
+  backend already maps `DuplicateApplicationException` to
+  `Status409Conflict`, and the Flutter side renders the brief's
+  exact user-facing string.
+
+**Verifying the 409 case.** Log in as an existing applicant, apply
+for a job you have already applied for, tap Submit. Expected: a
+SnackBar reading exactly `'You have already applied for this
+position.'` The verification is documented under MANUAL STEPS.
+
+---
+
+## PART 5 — Auth 401 automatic logout (Assignment 3.3)
+
+**Notifiers identified as calling an authenticated endpoint.**
+
+- **`applicationsProvider`** (`lib/providers/applications_notifier.dart`)
+  — both `build()` (calls `getApplications`) and `submit()` (calls
+  `submitApplication`) hit authenticated endpoints. Both apply the
+  Part 5 pattern.
+- **`savedJobIdsStreamProvider`** (`lib/providers/saved_jobs_notifier.dart`)
+  — this is a `StreamProvider` that watches the Isar
+  `savedJobCaches` collection LOCALLY. It doesn't call the API in
+  its `build()`; the network calls happen inside
+  `SavedJobsRepository.save()` / `remove()` / `syncPending()` on
+  the controller side. Those methods handle 401 through the
+  interceptor's `onUnauthenticatedProvider` callback (see
+  `lib/data/auth_interceptor.dart` and
+  `lib/providers/auth_provider.dart`) which invalidates
+  `authProvider`; the GoRouter's `refreshListenable` picks up the
+  transition and redirects to `/login`. So the Part 5 notifier-level
+  check is not additionally needed for the saved-jobs path — the
+  interceptor already drives the same outcome for the write paths,
+  and the read path is purely local.
+- **`jobsProvider`** — the `/jobs` endpoint is anonymous (`GET /jobs`
+  in `CareerHub.Api/Controllers/JobsController.cs` does not carry
+  `[Authorize]`) so a 401 from this endpoint is not expected against
+  today's backend. If the endpoint gains an auth requirement in a
+  future release, the same Part 5 pattern would extend to
+  `JobsNotifier.build()`.
+- **`authProvider`** — its `build()` calls `readAccessToken` (local
+  secure storage) and, on an expired token, `tryRefresh()` (network,
+  but with the repository's own catch-and-clear-storage behaviour).
+  A 401 during refresh never propagates as an `ApiResult` here.
+
+**The pattern used.** Inside `ApplicationsNotifier` both `build()`
+and `submit()` follow the same shape:
+
+```dart
+final repo = ref.read(applicationsRepositoryProvider);
+final authRepo = ref.read(authRepositoryProvider); // BEFORE first await
+
+final result = await repo.getApplications();       // or .submitApplication(...)
+
+if (result case ServerFailure(:final statusCode) when statusCode == 401) {
+  await authRepo.logout();
+  throw Exception('Your session has expired. Please sign in again.');
+}
+```
+
+**Deviation from the brief's `case Failure(statusCode: 401)`.** The
+brief's pattern-match assumes a single `Failure` variant on the
+sealed `ApiResult` hierarchy. This codebase's sealed hierarchy
+(from Assignment 2.2 Stretch C) uses three concrete variants
+(`NetworkFailure`, `ServerFailure`, `UnknownFailure`); the Part 5
+pattern here therefore matches on `ServerFailure(:final statusCode)
+when statusCode == 401` against the extant hierarchy. Same
+semantics, correct syntax.
+
+**Why the throw is necessary.** The `logout()` call flips
+`authProvider` to `Unauthenticated`, which fires the
+`AuthStateListenable` (see `lib/providers/auth_provider.dart`
+line 52 onward), which fires GoRouter's `refreshListenable` and
+schedules a redirect to `/login`. The redirect happens on the next
+frame — until it lands, the widget is still mounted against the
+notifier, and without the throw the notifier would return `null` /
+an empty list, which the `.when(data: ...)` arm renders as an
+empty state for ~one frame. Throwing puts the AsyncValue into
+`AsyncError` for that same frame, so the `.when(error: ...)` arm
+runs and the transition is invisible to the user.
+
+**Files touched.**
+- `lib/providers/applications_notifier.dart` — new. Landed with the
+  pattern in place. Both `build()` and `submit()` apply it.
+- `lib/screens/apply_screen.dart` — modified. Online submission
+  now routes through `ApplicationsNotifier.submit`, which is where
+  the 401 pattern lives. The ApiResult it returns is rendered as a
+  SnackBar so the 409 exact string and 422 exact string surface
+  correctly.
+- **No changes to `saved_jobs_notifier.dart` / `jobs_notifier.dart`
+  / `auth_notifier.dart`** — see the classification above for the
+  reasoning per notifier.
+
+---
+
+## PART 6 — WebSocket real-time updates (Assignment 3.3)
+
+**Files.**
+- `pubspec.yaml` — added `signalr_netcore: ^1.4.4` under
+  `dependencies:`. The brief specifies `^2.1.0` but pub.dev's
+  highest version at the time of writing is 1.4.4 (there is no 2.x
+  release track — see the doc-comment on the dep for the API-surface
+  compatibility note).
+- `lib/services/application_hub_service.dart` — new. `ApplicationHubService`
+  with `connect({required onApplicationUpdated, VoidCallback? onNewApplication})`
+  and `disconnect()`. Handler registration order (per Part 6.2's
+  checkpoint) is:
+    1. `HubConnectionBuilder().withUrl('${AppConfig.apiBaseUrl}/hubs/applications').withAutomaticReconnect().build()`
+    2. `on('ApplicationStatusUpdated', ...)` — registered BEFORE
+       start so an event during the handshake is not missed.
+    3. `onclose(...)` / `onreconnecting(...)` — debug prints.
+    4. `try { await start(); } on Exception catch (e) { print… }` —
+       graceful fallback, no re-throw.
+- `lib/providers/application_hub_provider.dart` — plain
+  `Provider<ApplicationHubService>` (no `@riverpod` annotation). The
+  factory constructs the service, calls `connect(...)` fire-and-
+  forget, and wires `ref.onDispose` to `service.disconnect`. Also
+  implements the Stretch A role-aware branching — see the
+  [Stretch A](#stretch-a--role-aware-hub-connection-assignment-33)
+  section below.
+- `lib/screens/applications_screen.dart` — the FIRST statement in
+  `build()` is `ref.watch(applicationHubProvider)`. That single
+  watch is what starts the connection when the tab opens and tears
+  it down when the tab closes.
+
+**Event.** `ApplicationStatusUpdated` — the .NET side would fire
+this via `IHubContext<ApplicationsHub>.Clients.User(applicantId)
+.SendAsync('ApplicationStatusUpdated', applicationDto)` inside
+`ApplicationService.UpdateApplicationStatusAsync`. The Flutter
+handler ignores the payload and calls
+`applicationsProvider.notifier.onHubStatusUpdated()`, which
+`invalidateSelf`s and triggers a full re-fetch. See README 3.3 Q3's
+fourth paragraph for why invalidate-refetch beats client-side
+in-place mutation (the offline-tunnel scenario would otherwise
+drift silently).
+
+**URL.** `${AppConfig.apiBaseUrl}/hubs/applications`. For the dev
+config that resolves to `http://10.0.2.2:5254/api/v1/hubs/applications`.
+
+**Observed outcome (manual verification — MANUAL STEP 2).** Placeholder
+below; fill from the terminal output of `flutter run
+--dart-define-from-file=config.dev.json`, log in, navigate to the
+Applications tab.
+
+- Expected line if the API has the hub mapped:
+  `ApplicationHubService: connected to http://10.0.2.2:5254/api/v1/hubs/applications`
+- Expected line if the API does not have the hub mapped
+  (the current state per the backend audit):
+  `ApplicationHubService: connection failed (…)` followed by
+  `ApplicationHubService: real-time updates are unavailable — the /applications screen will show static data and rely on pull-to-refresh.`
+
+**Observed:** `<paste terminal line here after MANUAL STEP 2>`.
+
+**Employer dashboard (Part 6.6).** No `/dashboard` route exists in
+the app today and no Employer dashboard endpoint exists in the
+backend today (see README 3.3 backend audit). Part 6.6 is therefore
+documented as a shape-only implementation: the
+`applicationHubProvider` accepts an `onNewApplication` callback
+that would wire a `NewApplicationReceived` handler on the service
+side, and Stretch C ships an `EmployerDashboardNotifier` that
+demonstrates the in-place-mutation pattern. Neither is consumed by
+any widget in the current app.
+
+---
+
+## PART 7 — runZonedGuarded and crash reporting (Assignment 3.3)
+
+**File.** `lib/main.dart`.
+
+**Shape.** `main()` now consists of a single `runZonedGuarded<Future<void>>`
+call. Inside the zone (`runZonedGuarded`'s first argument):
+
+1. `WidgetsFlutterBinding.ensureInitialized()` — bound inside the
+   zone so framework-error routing lives in the same zone as the
+   handler.
+2. `FlutterError.onError = (FlutterErrorDetails details) { FlutterError.presentError(details); _reportError(details.exception, details.stack); }`
+   — the framework-side of the two error surfaces.
+3. `Isar.open(...)` with the three schemas — unchanged from pre-3.3.
+4. `SharedPreferences.getInstance()` — unchanged.
+5. `ProviderContainer(overrides: [...])` — unchanged.
+6. `container.read(pendingSyncServiceProvider)` — unchanged.
+7. `runApp(UncontrolledProviderScope(...))` — unchanged.
+
+The zone's second argument is `_reportError` itself — passed as a
+function reference, not a wrapping lambda, so the signature matches
+`void Function(Object, StackTrace)` exactly.
+
+**`_reportError` gate.** Top-level function:
+
+```dart
+void _reportError(Object error, StackTrace? stackTrace) {
+  if (!AppConfig.isProduction) {
+    debugPrint('[UNCAUGHT ERROR] $error');
+    if (stackTrace != null) debugPrint(stackTrace.toString());
+    return;
+  }
+  // TODO: FirebaseCrashlytics.instance.recordError(error, stackTrace, fatal: true);
+}
+```
+
+The dev branch prints to the debug console via `debugPrint`; the
+prod branch is a TODO comment describing the Crashlytics /
+Sentry call. The gate is `AppConfig.isProduction`, which is a
+compile-time constant (see README 3.3 Q4's final paragraph on why
+this cannot be a runtime SharedPreferences flag).
+
+**Both surfaces route to the same reporter.** Framework errors
+(a build-method throw) reach `FlutterError.onError`, which calls
+`_reportError`. Dart async errors that escape a `try/catch` (a
+`Future.microtask(() => throw ...)`) reach the zone's error
+handler, which IS `_reportError`. Both classes of error therefore
+converge on the same crash-reporter TODO in production and the same
+`debugPrint` in development.
+
+**Test-error verification (Part 7.4 — MANUAL STEP 7).** The brief
+suggests temporarily adding `Future.microtask(() => throw Exception('Test
+error from zone'));` inside a `ConsumerWidget`'s `build` to observe
+the zone-caught path. This has NOT been added to a committed file
+— it would fail `flutter analyze` if left behind and would
+pollute the release binary if forgotten. Instructions to add it and
+remove it before committing live under MANUAL STEPS.
+
+---
+
+## PART 8 — Accessibility Audit and Release Build (Assignment 3.3)
+
+### Accessibility Audit
+
+**Screens audited** (Part 8.1 — MANUAL STEP 3):
+- `/jobs` — the job list.
+- `/jobs/:id` — the job detail screen.
+- `/jobs/:id/apply` — the two-step application form.
+- `/applications` — the new JobSeeker applications screen.
+
+**Findings counts (from the Widget Inspector's Accessibility
+Scanner — Part 8.1).** Fill from MANUAL STEP 3.
+
+| Finding category                                | Count |
+| ----------------------------------------------- | ----- |
+| Tap targets below 48x48 dp                      | `<paste>` |
+| Icon buttons lacking a `semanticsLabel`         | `<paste>` |
+| Decorative images lacking an `ExcludeSemantics` | `<paste>` |
+
+**Fixes applied (Part 8.2).**
+
+1. **`semanticsLabel` on every icon-only button** across
+   `lib/screens/home_screen.dart` (search, sort, sign-out) and
+   `lib/screens/job_detail_screen.dart` (bookmark toggle). Each
+   `Icon` now carries a `semanticLabel` parameter that TalkBack /
+   VoiceOver announces even in the absence of visible text.
+2. **`FilledButton.icon` "Apply for this job"** on
+   `JobDetailScreen` now enforces a 48-dp minimum tap target via
+   `style: FilledButton.styleFrom(minimumSize: Size.fromHeight(48))`.
+   Default `FilledButton.icon` minimum height is 40 dp, below the
+   Material Design and WCAG 2.1 AAA guideline.
+3. **Every status indicator on `/applications`** is wrapped in
+   `Semantics(label: 'Application status: ${status.displayName}',
+   container: true, child: ExcludeSemantics(child: Chip(...)))`.
+   Without the wrapper, a Chip whose label is a colour + a short
+   status word (Interviewing, Offered, Rejected) announces only
+   the raw text; the wrapper prepends "Application status:" so the
+   reader knows the widget's semantic role.
+
+**Remaining unresolved findings.** Fill from MANUAL STEP 3 after
+running the scanner.
+
+### Release Build
+
+**Fill from MANUAL STEP 5 after running `flutter build apk
+--release --analyze-size --dart-define-from-file=config.prod.json`.**
+
+- Total uncompressed APK size: `<paste from --analyze-size output>` MB
+- Three largest packages by contribution:
+  1. `<paste>`
+  2. `<paste>`
+  3. `<paste>`
+- Threshold assessment (10 MB recommended for initial install over
+  mobile data): `<Above / Below>`
+- If above threshold, one dependency to replace or defer: `<paste>`
+
+**AAB output** (`flutter build appbundle --release --dart-define-from-file=config.prod.json`):
+- `build/app/outputs/bundle/release/app-release.aab` produced.
+- Size: `<paste from Explorer>` (typically 30-50% smaller than the
+  APK because Google Play generates per-device APKs from the AAB).
+
+**AppConfig at compile time verification (Part 8.5 — MANUAL STEP 6).**
+Instructions to add a temporary Text widget displaying
+`AppConfig.environment` / `AppConfig.apiBaseUrl` and verify against
+each config live under MANUAL STEPS. Not committed — the temporary
+widget must be removed before submission.
+
+---
+
+## STRETCH A — Role-aware hub connection (Assignment 3.3)
+
+**File.** `lib/providers/application_hub_provider.dart` (already
+landed as part of Deliverable 6, since the branching sits inside
+the same provider factory).
+
+**Shape.** The provider reads `authProvider` at construction time
+and branches:
+
+- **Unauthenticated** — returns an `ApplicationHubService` instance
+  whose `_hubConnection` is null. `disconnect()` is registered on
+  `ref.onDispose` and is a safe no-op against a null connection.
+- **JobSeeker** — registers the `ApplicationStatusUpdated`
+  handler only. The handler calls
+  `applicationsProvider.notifier.onHubStatusUpdated()` which
+  invalidates the JobSeeker's own applications list.
+- **Employer** — would register the `NewApplicationReceived`
+  handler only, wired to the shape-only
+  `EmployerDashboardNotifier` (see Stretch C). Not exercised
+  against today's app because there is no employer login path and
+  no `User.role` field on the model. The branch exists so the
+  moment a role claim appears on the JWT the wire-up is complete
+  without a second refactor.
+
+**Information exposure risk (README requirement).** If a
+JobSeeker-role account received Employer-facing hub events, they
+would learn — for every new application submitted to the platform
+— the applicant email, the job listing ID, and the submission
+timestamp. That is a fan-out of every other JobSeeker's PII to
+every subscribed JobSeeker, plus a real-time competitive-intel
+leak (a JobSeeker could count how many people applied to a given
+listing since they did, in real time). The wire-up above prevents
+this at the client edge; a defence-in-depth server-side check
+(the SignalR hub's `[Authorize(Roles = "Employer")]` on the
+`NewApplicationReceived` broadcast destination) is the correct
+final defence, since a malicious client could bypass the client-
+side gate. Documented here so a future backend PR closing the hub
+side of the gap has the reasoning at hand.
+
+---
+
+## STRETCH B — Unit tests (Assignment 3.3)
+
+**Files.**
+- `test/unit/applications_repository_test.dart` — five tests
+  covering the ApplicationsRepository status-code branches: 200
+  Success, 401 (verifies `statusCode: 401` is on the returned
+  `ServerFailure`), 409 (asserts the exact `'You have already
+  applied for this position.'` string), 422 (asserts the exact
+  `'This listing is no longer accepting applications.'` string),
+  and null-statusCode `connectionError` → `NetworkFailure`.
+- `test/unit/applications_notifier_401_test.dart` — two tests
+  covering the `ApplicationsNotifier.build()` 401 path: (1) 401
+  from the mock repo triggers `authRepo.logout()` (verified with
+  `verify(...).called(1)`) and throws; (2) 503 from the mock repo
+  throws WITHOUT calling `logout()` (`verifyNever(...)`).
+
+**Approach — repository tests.** The brief suggests
+`http_mock_adapter`'s `DioAdapter`. This project does not have that
+package. To keep Stretch B self-contained without adding a new
+dev-dependency (and without expanding the analyze/CI surface), the
+repository tests use a hand-rolled `_MockDio extends Mock implements
+Dio` from mocktail — the same mocktail already used across Assignment
+3.2's tests. `Dio.post` and `Dio.get` are stubbed with either a
+`Response` (Success path) or a `DioException` (every failure path);
+`registerFallbackValue(Options())` covers `mocktail`'s named-parameter
+matcher requirement.
+
+**Approach — notifier test.** Uses `ProviderContainer` with
+`retry: (_, __) => null` (matches
+`test/unit/auth_notifier_test.dart`'s pattern to disable Riverpod's
+default retry-on-error) and overrides both
+`applicationsRepositoryProvider` and `authRepositoryProvider` with
+mocktail-backed mocks. The provider is mounted via
+`container.listen(...)` AFTER the per-test `when(...)` stubs are in
+place — otherwise `build()` runs against an unstubbed mock (returns
+`null` from `noSuchMethod`) and hangs.
+
+**Limitation of the 401 test (README requirement).** This unit
+test verifies that (a) `logout()` was called on the mock auth
+repository and (b) the notifier's future throws. It **cannot**
+verify that `authProvider` flipped to `Unauthenticated`, that the
+`AuthStateListenable` fired, that GoRouter's `refreshListenable`
+callback re-ran, or that the user's device landed on `/login`. The
+end-to-end navigation path spans four layers (notifier → auth
+listenable → GoRouter refresh → widget rebuild) and is only
+observable in a **widget test with a real `MaterialApp.router`
+mounted** or an **integration test with Patrol**. Assignment 3.2
+Stretch A already used a Patrol integration test for exactly this
+coverage against the biometric-gated login flow; adding another
+Patrol test here would duplicate the harness cost without adding
+new coverage this unit test does not already achieve.
+
+**Run.**
+```bash
+flutter test test/unit/applications_repository_test.dart \
+             test/unit/applications_notifier_401_test.dart
+```
+
+**Result at the time of writing:** `+7: All tests passed!`
+
+---
+
+## STRETCH C — Employer dashboard real-time counts (Assignment 3.3)
+
+**Files.**
+- `lib/models/employer_dashboard_state.dart` — new. Two-field
+  plain class (`activeListings`, `totalApplications`) with a
+  hand-rolled `copyWith`.
+- `lib/providers/employer_dashboard_notifier.dart` — new. An
+  `AsyncNotifier<EmployerDashboardState>` with three entry points:
+    - `build()` returns `EmployerDashboardState.empty()`
+      (shape-only — no `GET /dashboard/counts` endpoint on the
+      backend today).
+    - `onNewApplicationReceived()` — the in-place increment path.
+      Reads `state.valueOrNull`, and if non-null publishes
+      `AsyncData(current.copyWith(totalApplications: current.totalApplications + 1))`.
+      No `ref.invalidateSelf`.
+    - `reconcileFromServer()` — the drift-recovery path. Calls
+      `ref.invalidateSelf`. Not yet wired to anything (no timer,
+      no reconnect handler).
+- `lib/providers/application_hub_provider.dart` — modified. The
+  `onNewApplication` callback (Employer branch) now routes into
+  `employerDashboardProvider.notifier.onNewApplicationReceived()`
+  instead of the earlier `debugPrint` stub.
+
+**Trade-off: `ref.invalidate` vs in-place mutation.**
+
+| Property                   | `ref.invalidate`                   | In-place mutation           |
+| -------------------------- | ---------------------------------- | --------------------------- |
+| Network cost per event     | 1× `GET /dashboard/counts` per event | 0                           |
+| Latency to visible update  | Round-trip time                    | Sub-millisecond (a setState) |
+| Accuracy at steady state   | Server-authoritative               | Client-computed             |
+| Accuracy under packet loss | Self-heals (next fetch is truth)   | Drifts silently             |
+
+**The scenario where in-place mutation shows an incorrect count.**
+A JobSeeker submits an application at time T. The SignalR hub
+broadcasts `NewApplicationReceived` at T+50ms. The Employer's
+device is inside a tunnel (see README 3.3 Q3's offline-tunnel
+scenario) and the hub's automatic reconnect exhausts its retries
+during the outage. The event never arrives at the client. The
+JobSeeker's application row IS in the server-side count, but the
+client-side `totalApplications` field still shows the pre-event
+value. On the next reconnect the client renders a stale total
+until the next event increments it — at which point the total is
+still N applications short (where N is the number of events that
+fired during the outage).
+
+**Reconciliation strategy.**
+
+1. **Reconnect reconciliation** — the `HubConnection`'s
+   `onreconnected` callback (fired after the automatic-reconnect
+   state machine re-enters the connected state) calls
+   `dashboard.reconcileFromServer()`, which `invalidateSelf`s and
+   drives a fresh `GET /dashboard/counts`. This is the cheap
+   catch-all: one server round-trip per outage recovery, always
+   authoritative, self-healing.
+2. **Periodic reconciliation** — a `Timer.periodic(Duration(seconds:
+   60), (_) => dashboard.reconcileFromServer())` inside the
+   provider factory ensures drift caused by concurrent-user
+   changes (a colleague on the same Employer account acting from
+   a second device) is corrected within a bounded window even
+   without a reconnect event. The 60-second cadence is a
+   trade-off between drift latency and server load; a busy
+   hiring day tolerates a full minute of stale count in exchange
+   for a 60x reduction in dashboard-count requests versus a
+   5-second poll.
+
+Neither reconciliation mechanism is wired in this file — they
+would live inside `application_hub_provider.dart`'s Employer
+branch of the `onNewApplication` handler and would need their own
+tests. Both are documented in the notifier's class docstring so
+the code-review path is clear.
+
+---
+
+## MANUAL STEPS — Assignment 3.3
+
+Every step below is something Tebello runs (or verifies) manually,
+before submission. The order matters for a few of them — the
+release build (step 5) needs the config from step 1's second
+command; the accessibility scan (step 3) needs the app running from
+step 1.
+
+### 1. Run the app with each config
+
+From `careerhub_mobile/`:
+
+```bash
+flutter run --dart-define-from-file=config.dev.json
+```
+
+Expected:
+- Jobs list loads from the local `dotnet run` API at
+  `http://10.0.2.2:5254/api/v1` (assuming the Android emulator is
+  the target and the .NET API is running on the host machine).
+- Terminal shows the `LogInterceptor` request/response bodies (dev-
+  only, gated in `dioProvider`).
+- Login works, `/applications` tab renders the empty state.
+
+```bash
+flutter run --dart-define-from-file=config.prod.json
+```
+
+Expected:
+- Jobs screen shows a network error (the placeholder
+  `https://api.careerhub.example.com` URL is not reachable).
+- Terminal does NOT show LogInterceptor bodies (gated off in prod).
+
+Switch back to `config.dev.json` for steps 2 onward.
+
+### 2. Observe the hub connection outcome (Part 6.5)
+
+With `flutter run --dart-define-from-file=config.dev.json`, log in
+and tap the Applications tab. Watch the terminal.
+
+- If the API has the `/hubs/applications` hub mapped, you'll see:
+  ```
+  ApplicationHubService: connected to http://10.0.2.2:5254/api/v1/hubs/applications
+  ```
+- If the API does NOT have the hub mapped (the current backend
+  state), you'll see:
+  ```
+  ApplicationHubService: connection failed (<error>)
+  ApplicationHubService: real-time updates are unavailable — the /applications screen will show static data and rely on pull-to-refresh.
+  ```
+
+Copy whichever line appears into the README's **Part 6 → Observed**
+placeholder above.
+
+### 3. Run the accessibility scanner (Part 8.1)
+
+In VS Code with the Flutter extension, open the Widget Inspector
+(⌘⇧P → "Flutter: Toggle Widget Inspector") while the app is
+running. Enable the Accessibility overlay. Navigate to each of the
+four screens in turn:
+
+1. `/jobs` — at least one job card visible.
+2. `/jobs/:id` — tap any job to open its detail screen.
+3. `/jobs/:id/apply` — tap Apply on any open job.
+4. `/applications` — tap the third bottom-nav tab.
+
+For each, record:
+- How many tap targets are below 48x48 dp.
+- How many icon buttons lack a `semanticsLabel`.
+- How many decorative images lack `ExcludeSemantics`.
+
+Paste the counts into the README's **Part 8 → Findings counts**
+table above.
+
+### 4. Build the release APK (with size analysis) and the AAB
+
+From `careerhub_mobile/`:
+
+```bash
+flutter build apk --release --analyze-size --dart-define-from-file=config.prod.json
+```
+
+Look for the size-analysis output — Flutter prints the three
+largest packages by contribution. Note the total uncompressed APK
+size (printed as `App size: XX.X MB (total)`).
+
+```bash
+flutter build appbundle --release --dart-define-from-file=config.prod.json
+```
+
+Expected: `build/app/outputs/bundle/release/app-release.aab`
+exists. Its size on disk is typically 30-50% smaller than the APK
+because Play generates per-device APKs from it.
+
+### 5. Fill the release-build README fields (Part 8.3)
+
+Paste the values you observed in step 4 into the README's
+**Part 8 → Release Build** placeholders above:
+- Total uncompressed APK size (MB).
+- Three largest packages by contribution.
+- Threshold assessment (Above / Below the 10 MB recommended
+  install-over-mobile-data threshold).
+- If above, one dependency to defer or replace.
+
+### 6. Verify `AppConfig` at compile time (Part 8.5)
+
+To confirm `AppConfig.environment` / `AppConfig.apiBaseUrl` are
+constant-folded to the right values in the release build, add a
+temporary `Text` widget to any screen (e.g. `HomeScreen`'s
+`AppBar.title` slot):
+
+```dart
+Text('${AppConfig.environment} — ${AppConfig.apiBaseUrl}')
+```
+
+Run with `config.prod.json`. Confirm the widget shows `prod —
+https://api.careerhub.example.com/api/v1`. Then re-run with
+`config.dev.json`. Confirm it shows `dev — http://10.0.2.2:5254/api/v1`.
+
+**Remove the temporary widget before committing.**
+
+### 7. Remove any temporary test lines
+
+Before committing, verify no test-only additions have been left in:
+
+- No `Future.microtask(() => throw Exception('Test error from zone'))`
+  from Part 7.4.
+- No `Text('${AppConfig.environment}...')` from step 6.
+- No changes to `lib/data/auth_interceptor.dart` beyond what's
+  currently committed (Part 5.3 asks you to temporarily send an
+  invalid token to observe the 401 path).
+
+Grep to check:
+
+```bash
+grep -rn "Test error from zone\|AppConfig.apiBaseUrl.*Text\|invalid_token" lib/
+```
+
+Should return no matches.
+
+### 8. Commit and push
+
+Standard git commit + push. The two GitHub Actions workflows
+(`flutter_test.yml` from Assignment 3.2, `release.yml` from Part
+3) will run:
+- `flutter_test.yml` on every push and PR — analyze + tests.
+- `release.yml` on push to `main` only — analyze + tests + build
+  AAB + upload artifact.
+
+**Before pushing to main for the first time**, add the two
+GitHub Actions secrets the release workflow needs:
+- `CONFIG_PROD_JSON` — the full contents of `config.prod.json`
+  (real production URL if you have one, or the placeholder for
+  now).
+- `CONFIG_DEV_JSON` — the full contents of `config.dev.json`.
+
+Without these secrets the release workflow will fail at the
+"Write config.prod.json from secret" step.
+
+### 9. Verify the 401 automatic logout path (Part 5.3, optional)
+
+To observe the 401 path without waiting for a real token
+expiry, temporarily modify `lib/data/auth_interceptor.dart`'s
+`onRequest` to send an invalid Bearer:
+
+```dart
+options.headers['Authorization'] = 'Bearer invalid_token_for_verification';
+```
+
+Run the app, log in, and navigate to the Applications tab. Expected:
+- The app navigates to `/login` automatically.
+- No error screen is shown.
+- The login screen presents itself without a crash.
+
+**Revert the interceptor change before committing.**
+
+---
+
 # CareerHub — Assignment 3.1: Advanced UI Patterns & Performance
 
 _Written 2026-07-22._

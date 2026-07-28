@@ -90,7 +90,7 @@ final class DioProvider extends $FunctionalProvider<Dio, Dio, Dio>
   }
 }
 
-String _$dioHash() => r'63ea183507ba90325940c052add19b3e8c0e04ac';
+String _$dioHash() => r'4e1e16d544f4126065a32cf16504746089c1116f';
 
 /// Assignment 2.1 → 2.3 — the repository provider. Wires the singleton
 /// Dio, the singleton Isar instance, and the singleton SharedPreferences

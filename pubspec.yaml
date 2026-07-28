@@ -112,6 +112,20 @@ dependencies:
   flutter_form_builder: ^10.0.1
   form_builder_validators: ^11.1.2
 
+  # Assignment 3.3, Part 6.1 — SignalR client for the /applications
+  # real-time updates. `signalr_netcore` is the Dart implementation
+  # of the ASP.NET Core SignalR protocol; it constructs a
+  # HubConnection via HubConnectionBuilder, supports
+  # `withAutomaticReconnect()` (the resiliency mechanism the offline
+  # tunnel scenario in README 3.3 Q3 relies on), and registers
+  # message handlers via `hubConnection.on(eventName, handler)`.
+  # Pinned to `^1.4.4` — the brief specifies `^2.1.0`, but the
+  # highest version published on pub.dev at the time of writing is
+  # 1.4.4 (there is no 2.x release track). The API surface Part 6
+  # relies on (HubConnectionBuilder, .withUrl, .withAutomaticReconnect,
+  # .build, .start, .stop, .on) is identical across the 1.x line.
+  signalr_netcore: ^1.4.4
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

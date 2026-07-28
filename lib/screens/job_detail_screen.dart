@@ -220,7 +220,17 @@ class _JobDetailBody extends ConsumerWidget {
           onPressed: job.canApply
               ? () => context.push('/jobs/${job.id}/apply')
               : null,
-          icon: const Icon(Icons.send_outlined),
+          // Assignment 3.3, Part 8.2 — enforce the 48x48 dp
+          // minimum tap-target size. FilledButton.icon's default
+          // minimumSize is (64, 40) which falls below the 48-dp
+          // Material Design guideline (and the WCAG 2.1 AAA touch
+          // target guideline). `Size.fromHeight(48)` keeps the
+          // button full-width inside its parent while enforcing
+          // the vertical minimum.
+          style: FilledButton.styleFrom(
+            minimumSize: const Size.fromHeight(48),
+          ),
+          icon: const Icon(Icons.send_outlined, semanticLabel: 'Apply'),
           label: Text(
             job.canApply ? 'Apply for this job' : 'Applications closed',
           ),
@@ -259,7 +269,13 @@ class _JobDetailBody extends ConsumerWidget {
               }
             }
           },
-          icon: Icon(isSaved ? Icons.bookmark : Icons.bookmark_border),
+          icon: Icon(
+            isSaved ? Icons.bookmark : Icons.bookmark_border,
+            // Assignment 3.3, Part 8.2 — the icon's semantic label
+            // reflects the toggle state so a screen reader announces
+            // the CURRENT state rather than a generic "bookmark".
+            semanticLabel: isSaved ? 'Saved' : 'Save',
+          ),
           label: Text(isSaved ? 'Saved' : 'Save this job'),
         ),
       ],

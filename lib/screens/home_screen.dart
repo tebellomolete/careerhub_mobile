@@ -105,7 +105,13 @@ class _JobsAppBar extends ConsumerWidget implements PreferredSizeWidget {
       centerTitle: false,
       actions: [
         IconButton(
-          icon: const Icon(Icons.search),
+          // Assignment 3.3, Part 8.2 — explicit `semanticLabel` on
+          // every icon-only button. `tooltip` is announced by
+          // TalkBack when set, but the widget's `Icon` child also
+          // needs its own label so voice-control tools that query
+          // the accessibility tree by element name find "Search
+          // jobs" against this button.
+          icon: const Icon(Icons.search, semanticLabel: 'Search jobs'),
           tooltip: 'Search jobs',
           onPressed: () async {
             // showSearch owns its own Navigator route. The returned
@@ -119,7 +125,7 @@ class _JobsAppBar extends ConsumerWidget implements PreferredSizeWidget {
         ),
         const _JobSortAction(),
         IconButton(
-          icon: const Icon(Icons.logout),
+          icon: const Icon(Icons.logout, semanticLabel: 'Sign out'),
           tooltip: 'Sign out',
           onPressed: () {
             // Assignment 2.4, Part 9.3 — invalidate user-scoped
@@ -147,7 +153,10 @@ class _JobSortAction extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final sortOrder = ref.watch(sortOrderProvider);
     return PopupMenuButton<SortOrder>(
-      icon: const Icon(Icons.sort_by_alpha),
+      // Assignment 3.3, Part 8.2 — semanticLabel on the icon so
+      // TalkBack announces "Sort by title" when the trigger has
+      // focus.
+      icon: const Icon(Icons.sort_by_alpha, semanticLabel: 'Sort by title'),
       tooltip: 'Sort by title',
       onSelected: (value) =>
           ref.read(sortOrderProvider.notifier).state = value,
