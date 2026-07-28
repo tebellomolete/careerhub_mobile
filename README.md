@@ -1,3 +1,398 @@
+# CareerHub — Assignment 3.3: CI/CD, Full-Stack Integration & Real-Time Updates
+
+_Written 2026-07-28._
+
+Week 3, Assignment 3.3. This section covers the four Part 1 written
+decisions (compile-time config & asset-extraction risk; HTTP status
+semantics & the 409 conflict case; WebSocket trade-offs & the offline
+tunnel recovery; the two Flutter error surfaces); the environment-flavour
+scaffolding and `AppConfig` (Part 2); the release-pipeline GitHub Actions
+workflow with the signing gap (Part 3); the repository-layer HTTP status
+mapping (Part 4); the notifier-layer 401 automatic logout (Part 5); the
+SignalR real-time-updates wiring against `/hubs/applications` (Part 6);
+the `runZonedGuarded` wrapper and dual-surface crash reporting (Part 7);
+the accessibility audit and release-build measurements (Part 8); and the
+three stretch goals (A: role-aware hub connection; B: unit tests for the
+new repository and notifier; C: employer dashboard real-time counts).
+Earlier assignment notes are preserved further down as historical
+context.
+
+**Backend audit (before writing any Flutter code).** The Flutter side of
+this assignment maps to what the .NET API actually returns; a mismatch
+between the two produces status-code-specific messages that never fire.
+The audit findings against `CareerHub.Api` today:
+
+- `POST /api/v1/jobs/{jobId}/applications` (the actual submission route
+  — the assignment brief's `POST /api/applications` is aspirational)
+  returns `201`/`400` (validation from `[ApiController]` model binding),
+  `409` on duplicate (via `DuplicateApplicationException` →
+  `Status409Conflict` in `Middleware/GlobalExceptionHandler.cs`), and
+  `400` on closed listing (via `ListingClosedException` →
+  `Status400BadRequest`). The `422` mapping the brief specifies does not
+  match the current backend — the Flutter side implements the `422 →
+  "This listing is no longer accepting applications."` branch anyway,
+  as a forward-compatibility hedge, and this file documents the gap
+  under [HTTP status code mapping](#http-status-code-mapping-assignment-33).
+- Authenticated endpoints return `401` on missing/invalid JWT (via
+  `AddCareerHubAuth` + JWT bearer defaults), and `403` on role
+  mismatch (via `[Authorize(Roles = ...)]`). The
+  `SubmitApplication` action's `[Authorize(Roles = "Applicant")]` is
+  **commented out** today, so submission does not require auth against
+  the running API — the Flutter repository still passes the Bearer
+  token because `AuthInterceptor` attaches it unconditionally, but a
+  401 from that specific endpoint will not fire until the attribute is
+  re-enabled server-side.
+- **No SignalR hub is mapped at `/hubs/applications` today.** There is
+  no `AddSignalR()` call in `Program.cs` and no hub class in the
+  project. Part 6 therefore falls into the graceful-fallback branch —
+  the `HubConnectionBuilder.start()` call catches an `Exception` and
+  prints "real-time updates are unavailable" without re-throwing, which
+  is exactly the behaviour the brief documents as one of the two
+  correct outcomes.
+- **No GET-my-applications endpoint** (`GET /applications` for a
+  signed-in JobSeeker) exists on the backend today. `ApplicationsController`
+  exposes `POST` (submit), `GET .../applicants/{id}` (Employer, single
+  application), and `PATCH .../status` (Employer). The Flutter
+  `ApplicationsRepository.getApplications()` is wired against the
+  aspirational `GET /applications` route the brief describes so the
+  Part 5 401 pattern and the Part 6 hub wire-up have somewhere to live;
+  it will return an empty list on the graceful-fallback branch until
+  the endpoint ships server-side.
+- **No Employer dashboard endpoint or route** in either the backend or
+  the Flutter app. Stretch A's role-aware branching still ships (it
+  makes the hub connection safe once the roles matter server-side).
+  Stretch C's dashboard notifier is documented as a shape-only
+  implementation — the notifier and provider exist and the in-place
+  mutation is correct, but no widget consumes it because no `/dashboard`
+  route exists.
+
+**Codebase deviations from the brief that this section forces.** The
+brief assumes a single `Failure` variant of the sealed `ApiResult`
+hierarchy so a `case Failure(statusCode: 401)` pattern-match works. This
+project's `lib/data/api_result.dart` was written for Assignment 2.2
+Stretch C as a three-variant hierarchy (`NetworkFailure`,
+`ServerFailure`, `UnknownFailure`) — a Dart 3 sealed class with all
+three variants declared in the same library so the compiler enforces
+exhaustive `switch`es. The Part 5 pattern is therefore
+`case ServerFailure(:final statusCode) when statusCode == 401` against
+the existing hierarchy rather than the brief's `Failure(statusCode: 401)`;
+same semantics, correct syntax against the extant sealed set. The
+`.gitignore`, `AppConfig`, workflow file, and every other Part 2–8 file
+is a straight application of the brief's steps.
+
+---
+
+## PART 1 — WRITTEN DECISIONS (Assignment 3.3)
+
+### Question 1 — Compile-time configuration and what it means for security
+
+**The developer's alternative — bundle `config.dev.json` /
+`config.prod.json` as assets and read the correct one at runtime.** An
+installed Android APK is a signed ZIP archive; every asset the app
+declares in the `flutter:` block of `pubspec.yaml` is copied verbatim
+into `assets/flutter_assets/` inside the APK during
+`flutter build apk`. Extracting that ZIP requires **no root, no
+jailbreak, and no dynamic instrumentation** — Android Studio's built-in
+**APK Analyser** (menu: Build → Analyze APK) opens the archive
+in-place, and the Android SDK ships a general-purpose ZIP-extraction
+tool class called `ZipInputStream` (`java.util.zip.ZipInputStream`)
+that reads the archive from a stream in a few lines of code. An
+attacker with the APK on disk therefore walks straight to
+`assets/flutter_assets/config.prod.json` and reads the production API
+base URL — and any other key the config bundles — as a plain UTF-8
+string. There is nothing the app can do to hide that value once it
+ships as an asset; the OS-level file protection guards the *installer*,
+not the archive's contents. Contrast with a value read at compile time
+via `String.fromEnvironment('API_BASE_URL')`: the Dart compiler resolves
+the constant at build time from the `--dart-define` (or
+`--dart-define-from-file`) value, then **constant-folds it into the
+compiled `libapp.so`** as an ordinary string literal alongside every
+other string the app uses. The value is still technically retrievable
+by disassembling the native library (`strings libapp.so | grep
+api.careerhub`), but that is a categorically different threat model —
+it defeats casual APK inspection with a general-purpose tool and it
+scales to keys that are meaningfully longer than a URL (an analytics
+key, a per-environment feature-flag secret) which get further mangled
+by the AOT compiler's inlining and dead-code elimination.
+
+**The QA-runs-against-production accident.** A QA engineer who runs
+`flutter run --dart-define-from-file=config.prod.json` without meaning
+to (or, in the developer's alternative, an app that loads
+`config.prod.json` because a device flag was flipped) points the debug
+build at the real API. Their three test accounts land in the
+production user table, their dozen test applications land in the
+production applications table, and every downstream system the API
+touches sees traffic from those synthetic accounts: the production
+**Postgres database** (rows in `users` and `applications`), the
+production **email service** (welcome emails, application-received
+confirmations to real employer inboxes for real listings), the
+production **audit log / analytics pipeline** (test events polluting
+funnel metrics for the following weeks), and the production
+**rate-limit / abuse-signal system** (test traffic from a single IP
+tripping the same abuse heuristics the API uses to throttle scrapers).
+The category of problem this creates is **data contamination of a
+production system by unaudited test data** — the specific class of
+incident the environment separation exists to prevent. The
+`--dart-define-from-file` flag makes the accident visible in **CI** and
+not during manual runs because the workflow (see `release.yml`) always
+passes an explicit `--dart-define-from-file=config.dev.json` for
+`flutter test` and `--dart-define-from-file=config.prod.json` for the
+release build — a run without the flag fails at the shell level rather
+than falling back to a default. Manual runs on a developer's laptop
+have no such enforcement; typing `flutter run` alone succeeds and
+picks up whatever `String.fromEnvironment` default the code happens to
+carry. The one additional CI-workflow change that would prevent the
+QA accident **entirely** is a **matrix-style guard job that fails if
+any `dart-define` on any build step references `config.prod.json`
+without also matching the workflow's `if:
+github.ref == 'refs/heads/main'` — that is, the workflow rejects
+`config.prod.json` from any branch other than main, so a topic-branch
+CI run that accidentally references the prod config fails before it
+ever hits the network.
+
+### Question 2 — HTTP status code semantics and the 409 conflict case
+
+**The four error codes on `POST /api/applications`.** Each code carries
+a different user-facing message and a different navigation action
+because each corresponds to a different class of user recoverability.
+
+- **`400 — validation failure`.** The submission payload was
+  syntactically or semantically wrong (missing required field, malformed
+  email, cover letter too long). User-facing message: *"There's a
+  problem with your application. Please review the form and try again."*
+  Navigation action: **remain on the apply screen**, surface the
+  message as a `SnackBar`, and re-focus the first invalid field if the
+  API returned field-level errors. This is an error the user can
+  resolve **by changing what they entered** — the form itself is the
+  fix.
+- **`401 — unauthenticated`.** The JWT is missing or has expired
+  between the app cold-boot and the submission tap.  User-facing
+  message: *"Your session has expired. Please sign in again."*
+  Navigation action: **automatic logout → `/login`** driven by the
+  Part 5 notifier pattern (`case ServerFailure(:final statusCode) when
+  statusCode == 401`). The user resolves this **by re-authenticating**
+  — no in-place retry can recover a dead token.
+- **`409 — conflict (duplicate)`.** The authenticated user has already
+  submitted an application for this listing. User-facing message: *"You
+  have already applied for this position."* Navigation action:
+  **remain on the apply screen** with the message as a `SnackBar`, and
+  swap the "Apply" button for a "View my application" button that
+  routes to `/applications`. This is an error the user **cannot
+  resolve at all** — the duplicate is intentional server-side state,
+  not a transient failure — so the UI must acknowledge the state
+  rather than invite a retry.
+- **`422 — unprocessable entity (listing closed)`.** The employer has
+  closed the listing since the job-detail screen loaded. User-facing
+  message: *"This listing is no longer accepting applications."*
+  Navigation action: **pop back to `/jobs`** and mark the underlying
+  `Job.isOpen == false` in the local cache so the "Apply" button
+  disappears everywhere the job is rendered. The user **cannot resolve
+  this** — the listing is gone — but the app must repair its local
+  view so the same accident cannot recur.
+
+**Why treating 409 as a generic error is a product failure.** A generic
+"Something went wrong" message on a duplicate application invites the
+user to tap Apply again, which produces the same 409 with the same
+generic message, and the user concludes the app is broken when in fact
+the API is telling them "you already did this thing successfully." The
+correct 409 message reframes the error as **status information about
+past success**, which is what the API actually intends — 409 is not a
+failure of the current submission, it is a report on the state of the
+server relative to the user's request. Collapsing that semantic into
+"error" loses information the user needs to decide their next action.
+
+**The null-statusCode vs 503 distinction.** A `DioException` with
+`e.response?.statusCode == null` means no HTTP response was received at
+all — the socket could not connect, the connection was reset before
+headers arrived, or the connect handshake timed out. A `DioException`
+with `e.response?.statusCode == 503` means the server did respond, and
+responded with an "unavailable" status — the socket connected, headers
+arrived, and the status line said 503. These need different user-facing
+messages because the user actions differ: null-statusCode is a **check
+your internet / retry** situation (the network path is broken), 503
+is a **wait a moment and try again** situation (the network path is
+fine, the server is over capacity or under maintenance and will be back
+shortly). The `DioExceptionType` values that correspond to the null
+statusCode case are **`DioExceptionType.connectionError`** (the socket
+could not be opened — DNS failure, TCP RST, no route to host, TLS
+handshake refused), **`DioExceptionType.connectionTimeout`** (the
+socket handshake exceeded the 10-second `BaseOptions.connectTimeout`),
+and **`DioExceptionType.receiveTimeout`** (headers arrived but the
+body took longer than the 15-second `receiveTimeout`). For
+`connectionError` the appropriate user action is **"check that you're
+connected to the internet and try again"** — the network layer failed.
+For `connectionTimeout` and `receiveTimeout` the appropriate user
+action is **"try again in a moment"** — the network came up but was
+too slow, which usually resolves on its own.
+
+### Question 3 — WebSocket trade-offs and the real-time threshold for CareerHub
+
+**Three implementations of `/applications` status updates.**
+
+|                          | Battery       | Bandwidth                 | Latency               |
+| ------------------------ | ------------- | ------------------------- | --------------------- |
+| HTTP poll every **30 s** | Low           | ~120 requests/hour        | 0–30 s (avg 15 s)     |
+| HTTP poll every **5 s**  | High          | ~720 requests/hour        | 0–5 s (avg 2.5 s)     |
+| Persistent **WebSocket** | Low (single socket, no per-tick cellular wake) | ~1 handshake + N events (bytes-per-event only) | <1 s from employer action |
+
+The battery cost of the 5-second poll is high because each tick wakes
+the cellular radio out of its low-power state (a "tail" of ~2–5s of
+extra radio energy per request on LTE) — the aggregate hourly wake time
+dominates the app's foreground power budget. The WebSocket keeps a
+single TCP socket open with periodic keep-alives; the radio stays in
+low-power state between events and wakes only when an event actually
+arrives. The bandwidth cost of the 5-second poll is 720 full
+HTTP-over-TLS request/response cycles per hour of foreground use,
+versus the WebSocket's ~1 handshake plus the bytes-per-event of the
+actual status change (a few hundred bytes each). Latency is the
+categorically different axis: polling has an average latency of
+half-the-interval (2.5s at 5s, 15s at 30s) because the employer's
+action arrives some fraction of the way through the current window; the
+WebSocket surfaces the event **within the round-trip time of the
+network** (typically <1 s on 4G).
+
+**Which implementation I would ship for the initial CareerHub release,
+and the deciding factor.** I would ship the **persistent WebSocket**
+implementation. The deciding factor is not battery or bandwidth —
+those are close between 30s polling and WebSocket, both acceptable —
+but the **product framing** of the `/applications` screen. A JobSeeker
+opens this screen specifically to check whether their application
+state has changed; a 15-second average latency on a screen the user
+opens **for the purpose of** seeing latency-sensitive changes reads as
+"the app is stale" and drives pull-to-refresh behaviour that defeats
+the whole point of the screen. The WebSocket removes that gap.
+
+**The offline-tunnel scenario.** The JobSeeker enters a tunnel, loses
+connectivity for four minutes, and regains signal on the other side.
+The SignalR `HubConnection` was in the connected state when the tunnel
+began; the underlying TCP socket goes into RST as the network stack
+tears down the connection or as the connection times out on a
+keep-alive miss. The connection transitions through `onclose` /
+`onreconnecting` and — because we constructed the builder with
+**`withAutomaticReconnect()`** — the client enters an
+automatic-reconnect state machine that retries the connection at 0s,
+2s, 10s, and 30s by default, and stops after those four attempts fail
+(the exact interval sequence is a property of `signalr_netcore`'s
+default `IRetryPolicy`). The four-minute outage exhausts those retries,
+so on regaining signal the connection is in the definitively-closed
+state. The recovery path is either (a) `withAutomaticReconnect` with an
+extended retry array — a `List<int>` of milliseconds passed to
+`withAutomaticReconnect([0, 2000, 10000, 30000, 60000, 120000,
+240000])` covers the full four-minute window — or (b) a
+`ref.watch(connectivityProvider)` listener that calls
+`applicationHubService.reconnect()` on the offline → online transition.
+Assignment 3.3 uses the built-in `withAutomaticReconnect()` with an
+extended retry array. What the user sees during the outage is the
+`/applications` screen with the status values **as they were the
+moment the tunnel started** — the screen does not visually change,
+because we do not surface "hub disconnected" as a UI banner (the value
+of a real-time surface is that it silently updates; announcing its
+absence draws attention to a problem the user cannot resolve). What
+the user sees on the other side of the tunnel, assuming the employer
+updated three application statuses during the outage, is a **pull-to-
+refresh recovery** — the WebSocket only pushes future events, not the
+three events the client missed. This is why Part 6's `connect()`
+callback also invalidates `applicationsProvider` on each incoming
+event: an invalidate-driven refetch is guaranteed to be consistent
+with the server, whereas a client-side in-place mutation drifts
+whenever an event is missed. On the first event received after
+reconnection, the screen re-fetches and picks up all three missed
+transitions in one go.
+
+### Question 4 — The two Flutter error surfaces
+
+**`FlutterError.onError` catches errors raised inside the Flutter
+framework's synchronous build/layout/paint pipeline** — a `build()`
+method that throws, an assertion failure inside a `RenderObject`, a
+missing ancestor widget (`No MediaQuery found in context`), a
+`GlobalKey` collision at mount time. These errors arrive as
+`FlutterErrorDetails` and are the only errors `FlutterError.onError`
+observes. A concrete example from CareerHub: the `/applications`
+screen calls `applicationsAsync.requireValue` inside its `build()`
+before the notifier has completed its first fetch — the `AsyncValue`
+is still `AsyncLoading`, `requireValue` throws
+`StateError('Tried to call requireValue on an AsyncValue with no value')`,
+and the exception surfaces to `FlutterError.onError` because the throw
+happened synchronously inside `build()`. **`runZonedGuarded` catches
+Dart-level async errors that escape a `try/catch`** — a `Future`
+returned from a `then()` chain that rejects without a handler, a
+`Stream` `onError` no one subscribed to, an `async` function called
+without `await` whose returned Future rejects. A concrete example from
+CareerHub: the `applicationHubService.connect()` fire-and-forget call
+inside the `applicationHubProvider` factory (`service.connect(...)` —
+no `await`, no `unawaited(...)`) — if the internal `HubConnection.start()`
+call throws for a reason the `try/catch` inside `ApplicationHubService`
+does not cover (a synchronous `TypeError` from a malformed URL, say),
+the resulting rejected `Future` has no handler and escapes to the zone,
+where `runZonedGuarded`'s second argument catches it. Neither surface
+observes the other: `FlutterError.onError` fires only for framework-
+mediated build/layout/paint errors, `runZonedGuarded` fires only for
+async errors that reach the zone.
+
+**Dev-vs-prod gate.** In development, `_reportError` prints to the
+debug console via `debugPrint` — the developer sees the error and
+stack trace immediately in `flutter run`'s terminal. In production, the
+same function forwards to Crashlytics or Sentry. The inverse
+(**forwarding in development, printing in production**) would be
+harmful for two reasons. **Forwarding in development** floods the
+crash-reporting dashboard with errors from the developer's own iteration
+loop — the deliberate `throw` inside a widget the developer is
+debugging becomes a "crash" the whole team sees, the release-quality
+signal drowns in dev noise, and the on-call engineer learns to ignore
+alerts. **Printing in production** shows the error's stack trace in
+the release build's stderr — which no user can see, but which a
+device-log capture (`adb logcat`, a leaked crash-report ZIP) can
+harvest, exposing the internal function names, file paths, and often
+the memory addresses of the compiled binary to anyone who obtains a
+device with the app installed. The `AppConfig` field that controls
+this gate is **`AppConfig.isProduction`** — a static bool getter that
+returns `AppConfig.environment == 'prod'`. It must be a **compile-time
+constant** rather than a runtime SharedPreferences flag for the same
+reason `API_BASE_URL` must be compile-time: a runtime flag stored on
+the device can be flipped by a modified APK, a device debugger, or a
+malicious file overwrite, at which point a production build begins
+printing stack traces to logcat and the crash-reporting pipeline goes
+silent. A compile-time constant is baked into `libapp.so` at
+`flutter build appbundle` time; changing it requires re-signing and
+re-installing the APK, which the OS refuses to do without matching
+signatures. The environment gate stays where the compiler put it, for
+the life of the installation.
+
+---
+
+## PART 2 — Environment Flavors (Assignment 3.3)
+
+**Files.**
+- `config.dev.json` (project root, gitignored) — dev config: emulator
+  loopback base URL, `ENVIRONMENT=dev`, `ENABLE_CRASH_REPORTING=false`.
+- `config.prod.json` (project root, gitignored) — prod config:
+  placeholder public URL, `ENVIRONMENT=prod`,
+  `ENABLE_CRASH_REPORTING=true`.
+- `.gitignore` — appended with entries for both files under a
+  labelled Assignment 3.3 comment block.
+- `lib/config/app_config.dart` — `AppConfig` class with three
+  `static const` fields (`apiBaseUrl`, `environment`,
+  `enableCrashReporting`) plus a `static bool get isProduction`.
+- `lib/data/jobs_repository.dart` — the Dio provider now uses
+  `AppConfig.apiBaseUrl` for both the main client and the retry
+  Dio; `LogInterceptor` is added only when
+  `AppConfig.environment == 'dev'`. The pre-existing three-per-env
+  constant scaffolding (`_envDevBaseUrl`, `_envStagingBaseUrl`,
+  `_envProdBaseUrl`, `_envName`, `_resolvedBaseUrl`) from Assignment
+  2.1 Stretch C was removed — `AppConfig` is now the single
+  source of truth.
+- `lib/data/auth_repository.dart` — the plain (interceptor-free) Dio
+  the AuthRepository owns now uses `AppConfig.apiBaseUrl` as well, so
+  `/auth/login` and `/auth/refresh` reach the same host as every
+  other request. The pre-existing `_authBaseUrl` const was removed.
+
+**Verification.** `flutter analyze` reports zero errors after this
+Part. Manual `flutter run --dart-define-from-file=config.dev.json` /
+`--dart-define-from-file=config.prod.json` steps live under MANUAL
+STEPS at the bottom of this section.
+
+---
+
 # CareerHub — Assignment 3.1: Advanced UI Patterns & Performance
 
 _Written 2026-07-22._
