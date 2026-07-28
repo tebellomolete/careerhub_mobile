@@ -116,6 +116,29 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # Assignment 3.2, Part 2 — the three testing packages.
+  #
+  # `mocktail` is the runtime-mock library the unit tests in
+  # test/unit/jobs_notifier_test.dart and test/unit/auth_notifier_test.dart
+  # use to stub `JobsRepository.getJobs()` and `AuthRepository.readAccessToken()`
+  # and to `verify()` call counts on those methods. Pinned to ^1.0.4 rather
+  # than the brief's `^0.3.0` — the 0.x line predates the current analyzer
+  # constraint imposed by our other codegen deps (see the analyzer note under
+  # `custom_lint` above), and 1.x is the same API surface the brief describes
+  # (`Mock`, `when()`, `verify()`, `registerFallbackValue()`).
+  mocktail: ^1.0.4
+  # `patrol` supplies `patrolTest()`, `PatrolFinder` (the $ syntax), and
+  # the OS-permission helpers (`isPermissionDialogVisible()`,
+  # `tapOnPermissionDialogButton()`) used by the Part 7 integration test.
+  # `patrol` in dev_dependencies covers the Dart-side API; the `patrol_cli`
+  # global tool (installed via `dart pub global activate patrol_cli`) is
+  # what drives `patrol test` from the terminal.
+  patrol: ^3.14.0
+  # `integration_test` boots the Flutter engine on a real device (or an
+  # emulator) so `patrolTest` can pump the real app tree against the
+  # real API. Sourced from the SDK, not pub.dev.
+  integration_test:
+    sdk: flutter
   # Assignment 2.1 — dev-only tools. These run under `dart run
   # build_runner build` and produce lib/**/*.g.dart; they are NEVER part
   # of the compiled app. That's why they live under dev_dependencies:

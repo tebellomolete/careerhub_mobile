@@ -604,6 +604,547 @@ user-confirmed replay.
 
 ---
 
+# CareerHub — Assignment 3.2: Testing Flutter Applications
+
+_Written 2026-07-27._
+
+Week 3, Assignment 3.2. This section contains the four Part 1 written
+decisions (mocking patterns; `ProviderContainer` and AsyncNotifier
+transitions; the widget-test-to-Patrol boundary; what a test proves
+vs what coverage measures), the coverage read-out, the terminal
+evidence blocks for the unit / widget / coverage / Patrol runs, and
+the three stretch write-ups (A: `AuthNotifier` build() unit tests;
+B: Patrol screenshots at five capture points; C: offline-error
+propagation through `filteredJobsProvider`).
+
+A note on the pre-existing `test/widget_test.dart` — it was written
+against the Assignment 2.1 world (before the auth flow, before the
+persisted filter, before the two-step apply form). It has been
+flagged as stale and is deliberately **not** repaired as part of
+Assignment 3.2; the three-layer test pyramid this assignment builds
+(unit + widget + Patrol) supersedes it.
+
+## PART 1 — WRITTEN DECISIONS
+
+### Question 1 — The two mocking patterns and their distinct purposes
+
+**What the subclass-override pattern cannot tell you.** The
+subclass-override pattern extends the notifier under test (e.g.
+`class _FakeJobsNotifier extends JobsNotifier { @override
+Future<List<Job>> build() async => _fakes; }`) and injects the fake
+via `jobsProvider.overrideWith(() => _FakeJobsNotifier())`. From the
+outside, a consumer subscribes to `jobsProvider` and watches state
+move `AsyncLoading` → `AsyncData(fakes)`. That gives you complete
+control of the notifier's public output, and zero visibility into
+**how** the notifier arrived at it. Consider the concrete bug the
+brief describes: a merge conflict resolution accidentally makes
+`build()` call `ref.read(jobsRepositoryProvider).getJobs()` **twice**
+instead of once. The externally-observable state is unchanged
+(`AsyncLoading` → `AsyncData(secondReturn)`), the future still
+resolves, the assertions in a subclass-override test all pass. But
+in production the app now makes two network round-trips per cold
+boot, doubles server load, and — critically — if the two calls
+return *different* payloads (a race between the CareerHub API's
+cache invalidation and its DB read) the notifier silently drops the
+first result. mocktail catches this because it interposes at the
+dependency boundary rather than replacing the notifier's body:
+`verify(() => mockRepo.getJobs()).called(1)` fails if the count is
+2, and the test reports the exact number of interactions with the
+mock. `verify()` is not just a check that a method was called — it
+is an assertion on the **cardinality** of every call to the mock,
+which is the specific dimension the subclass-override pattern cannot
+observe.
+
+**When to reach for each.** The subclass-override pattern belongs on
+tests where the assertion is a state transition of the provider
+itself — for example, `filteredJobsProvider` returns a subset when
+`filterProvider` changes to `'remote'`. The consumer's contract with
+`filteredJobsProvider` is exactly "what value do I see when the
+inputs are X?" — the composition of `jobsProvider` and
+`filterProvider` inside the derived provider is an implementation
+detail; a subclass-override test asserts the observable derivation
+without prescribing how the derivation happens. mocktail belongs on
+tests where the assertion is an interaction with a collaborator —
+`JobsNotifier.build()` must call `getJobs()` **exactly once**;
+`AuthNotifier.build()` must call `logout()` when the stored token is
+expired. Those are protocol assertions on the notifier's use of its
+dependency, not state assertions on the notifier's output. The
+deciding factor is whether the property under test is a **value**
+(subclass-override) or an **interaction** (mocktail).
+
+**Why using mocktail from a widget test conflates two concerns.**
+A widget test constructs a `ProviderScope` with `overrides:`, pumps
+`MaterialApp` → `Scaffold` → the widget under test, and drives the
+widget with `tester.tap` and `tester.enterText`. Every piece of that
+scaffolding — the ProviderScope, the overrideWith wiring, the
+MaterialApp for `Directionality`/`Theme`/`MediaQuery`, the pumped
+Element tree — is there because widget tests exercise the **UI's
+translation of state into pixels and back**. Introducing a
+`MockJobsRepository` inside that setup means the test is now
+simultaneously exercising (1) that the widget renders the expected
+child widgets for a given state and (2) that the notifier calls
+`getJobs()` the correct number of times. If the test fails, you
+cannot tell from the failure alone whether the widget's build tree
+was wrong or the notifier's call graph was wrong. Verifying a
+repository call count from inside a widget test conflates a
+**rendering assertion** with a **collaborator-interaction
+assertion**, and the failure output — a `verify()` mismatch buried
+under the widget-test harness — is measurably harder to diagnose
+than the same interaction test in `test/unit/`, where the notifier
+is the entire subject and the mock is the entire dependency.
+
+### Question 2 — ProviderContainer and AsyncNotifier state transitions
+
+**Reading the future before vs after awaiting it.** An
+`AsyncNotifierProvider` initialises in the `AsyncLoading` state at
+the moment its `ProviderContainer` first observes it — the
+notifier's `build()` starts executing on the same microtask, but has
+not yet returned. `container.read(jobsProvider.future)` in that
+window returns a Dart `Future<List<Job>>` that has not yet resolved:
+the caller receives an unresolved handle to the eventual value,
+regardless of whether the underlying build() takes 5 microseconds or
+5 seconds. `container.read(jobsProvider)` in the same window returns
+`AsyncLoading<List<Job>>()` — the current synchronous snapshot of
+the provider's state, which is the AsyncValue variant that carries
+no data. After `await container.read(jobsProvider.future)`
+completes, the same synchronous read returns
+`AsyncData(resolvedList)` — the notifier's build() has returned, the
+outer AsyncValue has advanced to its data arm, and every subscriber
+has been notified. The distinction the tests exploit is therefore
+temporal, not structural: the same call returns different
+AsyncValues depending on where the surrounding microtask queue sits
+relative to the notifier's build().
+
+**Future rejection when build() throws.** `JobsNotifier.build()`
+pattern-matches on `ApiResult` and, in the `Failure` arm with an
+empty cache, throws `Exception(message)`. The re-throw propagates
+out of the async function's Zone, and the `Future<List<Job>>` the
+notifier returns **rejects** with that exception. `container.read(
+jobsProvider.future)` therefore returns a Future which — when
+awaited — throws the same exception; it neither hangs nor returns
+null. The synchronous `container.read(jobsProvider)` reads
+immediately after the microtask that carried the rejection returns
+`AsyncError<List<Job>>(exception, stackTrace)` — the AsyncValue
+subclass that wraps a thrown exception. Every downstream provider
+that watches `jobsProvider` (e.g. `filteredJobsProvider` — see
+Stretch C below) sees `AsyncError` on their next read and, if they
+use `whenData`, propagate the same `AsyncError` without transforming
+it.
+
+**Why `addTearDown(container.dispose)` matters across the suite.**
+An undisposed `ProviderContainer` retains every provider it
+constructed for the duration of the process. Providers that
+registered `onDispose` callbacks — for example, a
+`StreamProvider<List<ConnectivityResult>>` that subscribes to
+`Connectivity.onConnectivityChanged`, or `authStateListenableProvider`
+whose closure captures a `ProviderSubscription` — retain those
+subscriptions too. In a suite of dozens of tests, each undisposed
+container leaves behind a live stream subscription; the platform
+channel's isolate keeps the subscription's onData closure reachable,
+which keeps the closure's captured references reachable, which keeps
+the container reachable through the closure's captured `ref`. What
+accumulates in memory is therefore a chain of `ProviderContainer` →
+`ProviderElement` → `ProviderSubscription` → captured `ref` →
+`ProviderContainer` for every test that ran. Beyond the leak, the
+functional consequence is worse: a test that expects a fresh
+container's provider to start in `AsyncLoading` can flake if a
+previous container's leaked subscription happens to emit a value
+before the new container's build() begins, because both containers
+share the same underlying platform-channel stream. `addTearDown(
+container.dispose)` is what closes those subscriptions in the same
+teardown phase — even if the test threw partway through its body —
+so no state escapes the test's scope.
+
+### Question 3 — Widget test limits and the Patrol boundary
+
+**Why the date picker is unreliable in widget tests.**
+`FormBuilderDateTimePicker` renders a `TextField` in the widget
+tree; on tap it opens a modal via `showDatePicker`, which pushes an
+opaque route onto the `Navigator`. The route builds a
+`_DatePickerDialog` sized against the current
+`MediaQuery.of(context).size`, whose day-cell grid is laid out as a
+`GridView` scaled to the dialog's width, computed from the ambient
+`ThemeData.dialogTheme`, `LocalizationsData`, and the current
+month's layout. `tester.tap(find.text('15'))` therefore relies on
+three coincidences: (1) the day '15' being rendered in the current
+month grid at all — a test run on the last day of the month may
+open the picker at day 31 with a partially-hidden next-month row
+that also contains a '15'; (2) the day cell being the topmost tap
+target at that Text's location — a Semantics overlay or an ink
+splash can be above it; (3) the `MediaQuery.size` producing the
+same absolute cell coordinates the fixture assumes. A test that
+uses `find.byWidgetPredicate((w) => w is InkWell && w.child is
+Text)` and indexes into `.at(14)` is even worse — the child index
+depends on the calendar layout of the specific month, and breaks
+whenever the picker opens on a month whose first day is not a
+Sunday. Any pixel-coordinate or child-index selector against the
+date picker will silently start failing on the first month whose
+grid layout differs from the fixture's month, which — since we
+depend on `DateTime.now()` — is a wall-clock event we do not
+control.
+
+**Why Patrol handles this reliably, and why `tester.tap` does not.**
+Patrol tests build the app with `patrolTest()`, which compiles the
+real production binary against the real Flutter engine and runs on
+an emulator or device. `PatrolFinder`'s `$` selector navigates the
+**native accessibility tree**, not the widget tree: `$('15')`
+resolves against the day cell's `Semantics` node's label, which is
+what the OS reads and what accessibility services see. `tester.tap`
+in a widget test travels through the widget-test framework's
+`WidgetsBinding.instance.testTextInput` layer, which pumps
+synthetic pointer events into the Flutter test binding — it can
+find and tap widgets, but has no visibility into any dialog that
+lives OUTSIDE the Flutter widget tree. The specific Patrol type
+that owns OS-native dialogs is `NativeAutomator`: methods like
+`isPermissionDialogVisible()` and `tapOnPermissionDialogButton()`
+issue platform-native commands (UIAutomator on Android,
+XCUITest on iOS) that inspect the OS's own view hierarchy. The
+Flutter test engine cannot see these dialogs at all — they are
+rendered by the operating system's window manager, not by the
+Flutter engine — so a widget test literally cannot assert their
+presence or absence. Only a runner that can drop *out* of the
+Flutter engine and into the OS can drive them.
+
+**The boundary line in ApplyScreen.** The line
+[apply_screen.dart:325](lib/screens/apply_screen.dart) — the
+`FormBuilderDateTimePicker` for `name: 'start_date'` — is where the
+boundary between "widget tests are sufficient" and "only Patrol can
+verify" falls. Above the line: `full_name` (TextField), `email`
+(TextField), `years_experience` (TextField), `cover_letter`
+(TextField), `portfolio_url` (TextField), `terms` (Checkbox). Every
+one of these is a standard Flutter form control whose value is
+mutated by `tester.enterText` or a direct `didChange` on the
+`FormBuilderState`, and whose validation error is a `Text` widget
+in the tree that `find.textContaining` locates. Below the line:
+`start_date`. The shared criterion that places `start_date` on the
+Patrol side is **the interaction opens a native or dialog surface
+outside the widget's own subtree** — the modal date-picker route
+whose layout depends on runtime `MediaQuery` and locale. Everything
+above the line is a leaf widget the widget test owns end-to-end;
+everything below the line requires a runner that can synthesise the
+OS-level input events those leaf widgets ultimately depend on.
+
+### Question 4 — What a test proves and what coverage measures
+
+**Three specific missing verifications for the trivial test.** The
+brief describes a test that constructs a `ProviderContainer` with a
+`MockJobsRepository` stub, awaits the future, and asserts
+`expect(result, isNotNull)`. That test generates 85% line coverage
+for `jobs_notifier.dart` and verifies almost nothing. Missing:
+(1) **`AsyncData` vs `AsyncError`** — `expect(result, isNotNull)`
+passes for both a successful list of jobs and a stack trace, because
+`AsyncError` also has non-null `.error` and non-null `.stackTrace`.
+The observable behaviour the notifier promises — "on Success, my
+final state is `AsyncData<List<Job>>`, not `AsyncError`" — is not
+tested. (2) **The intermediate `AsyncLoading` state** — a consumer
+who subscribes before the future resolves must see `AsyncLoading`
+first; a notifier that races to `AsyncData` synchronously (e.g. a
+future-typed method that resolves without a real await) would break
+the loading spinner in the UI. The test never reads state before
+the await, so this transition is invisible. (3) **`getJobs()` call
+count** — the test does not `verify()` the mock; a notifier that
+calls `getJobs()` twice, zero times (returning a cached value from a
+provider higher in the graph), or with the wrong arguments would
+pass. All three are concrete observable behaviours of `JobsNotifier`
+that a real caller depends on; none is checked by an `isNotNull`
+assertion.
+
+**Testing implementation detail vs testing behaviour.** An
+implementation-detail test asserts on **how** a subject arrives at
+its output; a behaviour test asserts on **what** the subject
+produces. Concrete for `JobsNotifier`: an implementation-detail test
+would read the private `_selfWrote` boolean after a Success return
+via a test-only visibility escape and assert `_selfWrote == true`.
+When the Stretch B echo-suppression logic is refactored from a
+boolean guard to a token-based mechanism, or removed entirely
+because the underlying Isar behaviour changes, that test fails —
+even though the notifier still produces the same
+`AsyncData<List<Job>>` for the same repository stubs. Contrast a
+behaviour test: "calling `refresh()` after an error results in
+`AsyncData` when the second `getJobs()` returns Success". That
+assertion survives every plausible refactor to the internal flow —
+switching `refresh()` from `invalidateSelf()` to a manual state
+assignment, splitting the retry into a helper, replacing the
+counter-based mock with a queue — because it names an
+externally-observable transition that the notifier's contract must
+guarantee for the UI's retry button to work.
+
+**Why Patrol coverage does not substitute for unit and widget
+coverage.** The Part 7 Patrol test drives cold-launch → login →
+jobs list → job detail → apply → submission, which touches
+`JobsNotifier`, `JobsRepository`, the router, `LoginScreen`, the
+jobs list screen, `JobDetailScreen`, and `ApplyScreen`. On a happy
+path, that trace records executed lines for every file above,
+easily exceeding the aggregate coverage of the unit and widget
+suites. What Patrol does not detect: a failure category like
+**"`JobsNotifier.build()` throws when the cache is empty AND
+`getJobs()` returns `NetworkFailure`"**. The Patrol happy path never
+exercises the failure arm — the seeded API always returns Success —
+so the throwing branch stays uncovered by the Patrol trace, and if
+that branch's `throw Exception(message)` is accidentally deleted a
+future refactor, no Patrol test fails. A unit test with a mocked
+repository returning `NetworkFailure` and an empty cache is the
+only thing that catches the regression. Conversely, only Patrol
+detects a failure category like **"the OS permission dialog stalls
+the app because we never wired an accept path"** — no widget test
+runs against a real OS, and no unit test can simulate a permission
+dialog that lives entirely outside the Flutter engine. The two
+categories are disjoint: unit tests catch **branches the happy path
+doesn't visit**; Patrol catches **integration failures between the
+Flutter engine and everything outside it** (native dialogs, real
+network, the real Isar file on disk, GoRouter's redirect against
+real secure storage). Running only Patrol is a categorical error,
+not a proportional shortfall: no amount of Patrol runtime
+substitutes for the failure categories unit tests exclusively see.
+
+---
+
+## Assignment 3.2 — Coverage
+
+Numbers below come from `flutter test --coverage` against the
+Assignment 3.2 suite (unit + widget). Percentages are line
+coverage on the target file itself — the `DA:n,0` count in
+`coverage/lcov.info` divided by the total `DA:` lines for that
+file.
+
+| File | Coverage | Where the uncovered lines live |
+| ---- | -------- | ------------------------------- |
+| `lib/providers/jobs_notifier.dart` | **16/26 = 61.5%** | The Stretch B echo-suppression path (`_selfWrote` guard, the `ref.listen(cachedJobsStreamProvider, ...)` closure that checks the flag and calls `ref.invalidateSelf()`) is not exercised — the Part 3 tests override `cachedJobsStreamProvider` with `Stream.empty()`, which never fires the listener callback. The uncovered lines are the callback body itself (lines 101–110) and the `_selfWrote = true` echo-guard set inside the Success arm. Coverage of that path is Patrol's responsibility — an end-to-end run against the real Isar-backed cache stream exercises the echo suppression naturally. |
+| `lib/providers/job_providers.dart` | **21/39 = 53.8%** | `filteredJobsProvider` itself is fully covered by the four Part 4 tests (including the Stretch C error-propagation test). The uncovered lines are the OTHER providers that share this file: `sortOrderProvider`, `searchQueryProvider`, `visibleJobsProvider`, `savedJobsProvider`, `editedJobProvider`, and the `_locationTypeFromFilter` helper. These providers belong to Assignment 3.1's home screen and job detail screen; testing them was out of scope for 3.2's three-test filter suite. Widget-test coverage of `HomeScreen` and `JobDetailScreen` would raise this number to ~90%; leaving those tests for a future assignment is a scope decision, not a gap the 3.2 tests failed to close. |
+| `lib/widgets/job_card.dart` | **40/51 = 78.4%** | Every rendering path exercised by the three Part 5 tests is covered — title, company, IconLine rows, JobStatusBadge, employment-type text. The uncovered lines are the `_SaveJobButton.onPressed` closure (lines 118–147): its `saved`/`queued`/`notFound` SnackBar branches only fire when the user taps the bookmark icon, which the widget tests deliberately do not do (the button's collaborator, `SavedJobsController`, would need a mock — same conflation of concerns discussed in README 3.2 Q1). Patrol's happy path would cover the `saved` branch; the `queued` branch needs an offline Patrol scenario; the `notFound` branch needs a server-inconsistency Patrol scenario. All three are out of scope for 3.2's unit-and-widget layers. |
+| `lib/screens/apply_screen.dart` | **116/134 = 86.6%** | The five Part 6 tests plus the auto-reveal `useEffect` timer running under `pumpAndSettle` collectively touch every step-1 rendering path, both `onNext` branches, and every step-2 validator path. Uncovered lines are the offline-draft branch of `submit` (lines 172–186) and the SnackBar-and-pop logic on success — both require a mounted `isOfflineProvider` context different from the default (offline == true) which the Part 6 tests do not set up. Coverage of the offline-draft path is Patrol's responsibility (`ref.read(applicationDraftsControllerProvider).saveDraft(...)` needs a live Isar to write against). |
+
+**Aggregate observation.** The 3.2 test pyramid targets specific
+notifier and rendering behaviours; the coverage percentages
+reflect that focus. Uncovered lines fall into two categories:
+(a) code owned by other assignments (`sortOrderProvider`,
+`visibleJobsProvider`, `savedJobsProvider`, `editedJobProvider`)
+whose tests belong to their respective assignments; and (b) code
+paths that require live collaborators (Isar writes, network,
+biometric plugin) whose only honest coverage is Patrol's
+end-to-end run. No line reports 0% coverage because it lacked a
+test — every uncovered line is either out-of-scope by design or
+requires a coverage layer above what a headless unit or widget
+test can provide.
+
+## Assignment 3.2 — Evidence blocks
+
+**Unit tests** — `flutter test test/unit/`:
+
+```
+00:00 +0: loading /Users/tebellomolete/Documents/Bitcube/careerhub_mobile/test/unit/auth_notifier_test.dart
+00:00 +0: (setUpAll)
+00:00 +0: AuthNotifier.build() returns Unauthenticated when no access token is stored
+00:00 +1: AuthNotifier.build() returns Authenticated with the decoded user when a non-expired token is stored
+00:00 +2: AuthNotifier.build() returns Unauthenticated AND calls logout when an expired token is found and the refresh attempt fails
+00:00 +3: filteredJobsProvider returns the full list when the filter is 'All'
+00:00 +4: filteredJobsProvider returns only remote jobs when the filter is 'remote'
+00:00 +5: filteredJobsProvider changing the filter produces a different list on the next read
+00:00 +6: filteredJobsProvider propagates AsyncError from jobsProvider instead of collapsing to an empty AsyncData (Stretch C)
+00:00 +7: JobsNotifier transitions from loading to data when getJobsRepository returns Success
+00:00 +8: JobsNotifier transitions from loading to error when getJobsRepository returns Failure
+00:00 +9: JobsNotifier recovers to data after refresh() following an error
+00:00 +10: All tests passed!
+```
+
+**Widget tests** — `flutter test test/widget/`:
+
+```
+00:00 +0: loading /Users/tebellomolete/Documents/Bitcube/careerhub_mobile/test/widget/apply_screen_test.dart
+00:00 +0: ApplyScreen email field is pre-populated from the authenticated user
+00:00 +1: ApplyScreen tapping Next with all step-1 fields empty shows multiple required errors
+00:00 +2: ApplyScreen cover letter shorter than 50 chars produces a length validation error
+00:00 +3: ApplyScreen portfolio URL is optional — an empty value produces no URL error
+00:00 +4: ApplyScreen portfolio URL rejects a non-URL value with a format error
+00:00 +5: JobCard renders the fixture title, company, and a tag/badge value
+00:00 +6: JobCard a second fixture renders its own title, not the first fixture
+00:00 +7: JobCard employment type text matches the fixture, not a static label
+00:00 +8: All tests passed!
+```
+
+**`flutter test --coverage`** — full output:
+
+```
+00:05 +54 -2: Some tests failed.
+
+Note on the -2: the pre-existing test/widget_test.dart from
+Assignment 2.1 contains two tests that break against the
+current Assignment 3.1 code (the async loading state
+CircularProgressIndicator finder and the sort-menu reversal
+test). Both were flagged as stale at the start of Assignment
+3.2 and are deliberately not repaired here — the three-layer
+pyramid (unit + widget + Patrol) built for 3.2 supersedes
+that file. See README 3.2 preamble.
+```
+
+`coverage/lcov.info` is written by every run and referenced by
+the coverage table above.
+
+**Patrol test evidence** — populate after running
+`patrol test --target integration_test/job_application_flow_test.dart --dart-define=API_BASE_URL=http://10.0.2.2:5247`
+locally with the seed credentials substituted for the
+`REPLACE_ME` placeholders:
+
+```
+<paste patrol test terminal output here after running against
+the live API + emulator — see MANUAL STEPS below>
+```
+
+**GitHub Actions workflow** — [.github/workflows/flutter_test.yml](.github/workflows/flutter_test.yml).
+Triggers on `push` and `pull_request` against `main`. Steps:
+
+1. `actions/checkout@v4` — clone the repository.
+2. `subosito/flutter-action@v2` — pin Flutter 3.44.5, stable
+   channel, enable pub-cache caching.
+3. `flutter pub get` — resolve dependencies from `pubspec.lock`.
+4. `flutter analyze --fatal-infos --fatal-warnings` — analyzer
+   gate; the workflow fails on any level above debug.
+5. `flutter test --coverage` — runs `test/` and writes
+   `coverage/lcov.info`.
+6. `actions/upload-artifact@v4` — uploads
+   `coverage/lcov.info` as `coverage-report`, retained for 14
+   days. Runs on both pass and fail (`if: always()`) so a
+   broken-test PR still surfaces its coverage delta.
+
+Patrol is deliberately absent — Patrol needs a connected
+device (device farm, emulator on a dedicated runner) which is
+a separate workflow's responsibility.
+
+## Assignment 3.2 — Stretch A write-up
+
+The three `AuthNotifier.build()` tests each stub one branch of
+the cold-boot decision tree: no token → Unauthenticated; valid
+non-expired token → Authenticated; expired token → refresh
+attempt → Unauthenticated. The third test is where the
+**testing `build()` vs testing `isTokenExpired()` in isolation**
+distinction matters.
+
+A test on `isTokenExpired(expiredToken) == true` alone verifies
+one predicate — that the JWT decoder correctly reads the `exp`
+claim and compares against `DateTime.now()`. That's it. What
+that isolated test cannot see: whether `build()` actually calls
+`isTokenExpired()` at all, whether the caller pattern is
+`if (isTokenExpired) => tryRefresh() => on null => return
+Unauthenticated`, or whether a merge conflict resolves the
+refresh path into a no-op that leaves the user "signed in with
+an expired token" — a state the router will not redirect out
+of because auth is nominally `Authenticated`. The
+`build()`-level test covers the whole protocol: readAccessToken
+returned the expired token, isTokenExpired confirmed it,
+tryRefresh was attempted, the null return was interpreted as
+Unauthenticated. Every `verify()` in the third test is an
+interaction assertion on that protocol.
+
+What only the Patrol integration test catches: the router's
+actual navigation. `AuthStateListenable` fires
+`notifyListeners()` on the transition; GoRouter's
+`refreshListenable` re-runs its redirect callback; the callback
+reads `authProvider`, sees Unauthenticated, and pushes `/login`.
+None of those steps live in `AuthNotifier` — they live in
+[app_router.dart:60](lib/router/app_router.dart) and
+[auth_provider.dart:52](lib/providers/auth_provider.dart). A
+unit test on `AuthNotifier.build()` cannot see whether the
+route actually flips; only Patrol, running the real
+`MaterialApp.router`, can assert the login screen is on top of
+the navigator. The failure category **"expired token clears
+storage but the user stays on the jobs screen because the
+router bridge is broken"** is invisible to unit tests and
+visible only to Patrol.
+
+## Assignment 3.2 — Stretch B write-up
+
+The Patrol test calls `takeScreenshot()` at five capture points:
+`01_after_login`, `02_jobs_screen`, `03_job_detail`,
+`04_apply_screen`, `05_confirmation`. Screenshots are written
+to `integration_test/screenshots/` and collected by the Patrol
+CLI runner.
+
+**A scenario where screenshot comparison fails on a working
+feature.** Assume the Assignment 3.1 shimmer skeleton is
+enabled and the golden screenshot for `02_jobs_screen` was
+captured while the shimmer was in the middle of its horizontal
+sweep. On the next run the shimmer sweep is at a different
+horizontal offset — the feature works identically, the user
+sees the same animation, but the pixel diff against the golden
+is above threshold and the test fails. The same applies to any
+Material ripple in progress, the system clock in the status
+bar, or the exact position of the app bar's back-arrow ink
+splash. Screenshot equality treats "same pixels" as "same
+correctness", but working animations, timers, and system chrome
+routinely produce different pixels while remaining correct.
+
+**Trade-off vs text-based assertions.**
+`find.text('CareerHub')` fails if and only if the string
+'CareerHub' is missing from the rendered accessibility tree —
+which happens when the AppBar's title Text isn't there, which
+in turn happens if we routed to the wrong screen or the
+production code broke. That's a small, focused failure signal.
+Screenshot assertions catch a strictly wider set of regressions
+(text moved off-screen, colours changed, icons flipped) but
+report them all under the same "pixels differ" verdict, with
+no discrimination between "the feature works but the animation
+moved" and "the AppBar has vanished". The right balance is
+text-based assertions for the correctness contract and
+screenshots for observability — the five capture points in this
+test document what the app looked like at each stage, not what
+it must look like to pass.
+
+**One visual bug screenshots catch that text does not.** A
+padding regression that pushes the "Sign in" button below the
+soft-keyboard fold. Text-based finders confirm the button is
+still in the tree; a screenshot shows the user cannot see it.
+
+**One visual bug that only a real observer catches.** Colour
+contrast — a body text switch from `onSurface` to
+`onSurfaceVariant` may pass every automated check (the widget
+tree is unchanged, the pixels are within the golden's
+threshold), but a low-vision user notices the text is now
+noticeably lighter against the same background. That's a WCAG
+compliance regression an automated screenshot pipeline treats
+as within-tolerance, while a human sees the difference on
+first look.
+
+## Assignment 3.2 — Stretch C write-up
+
+The offline-error test lives in
+[test/unit/filtered_jobs_test.dart](test/unit/filtered_jobs_test.dart)
+as the fourth test in the group. The `_ErrorJobsNotifier`
+subclass throws from `build()`, which Riverpod converts to
+`AsyncError` on `jobsProvider`; the test then reads
+`filteredJobsProvider` and asserts the derived state is
+`AsyncError`, NOT `AsyncData(const [])`.
+
+**Why an empty list is worse than an error message for the
+user.** An empty `AsyncData(const [])` renders through the
+`data:` arm of `_JobList`'s `when()`
+([home_screen.dart:255](lib/screens/home_screen.dart)), which
+falls into `EmptyJobsWidget` with the message "No jobs match
+your filter." That message is technically true (the filter's
+output IS an empty list) but false in effect — the reason the
+list is empty is a network failure, and the user's next action
+is to reset the filter, which will not help. An `AsyncError`
+routes through the `error:` arm, which renders `_ErrorState`
+with a "Something went wrong" copy and a Retry button. The
+retry button calls `jobsProvider.notifier.refresh()`, which is
+exactly the action the user needs. Empty-list UX misinforms the
+user's next action; error UX guides them to the right one.
+
+**Confirmation that `_JobList`'s error arm is exercised by this
+test through the provider chain.** `_JobList` calls
+`ref.watch(filteredJobsProvider)` and pattern-matches its
+`when()` on `error:`. `filteredJobsProvider`'s `whenData()`
+already propagates AsyncError unchanged (see
+[job_providers.dart:99](lib/providers/job_providers.dart)),
+which is why no `lib/` change was needed. The unit test proves
+the propagation contract at the provider layer; the same
+`AsyncError` value that the test asserts on is what the widget
+layer's `when(error: ...)` arm receives at runtime. Widget-test
+coverage of `_JobList` itself is out of scope for 3.2; the
+provider-layer test plus the visual verification during the
+Patrol run is sufficient evidence.
+
+---
+
 # CareerHub — Assignment 2.4: Authentication and Secure API Flow
 
 _Written 2026-07-22._

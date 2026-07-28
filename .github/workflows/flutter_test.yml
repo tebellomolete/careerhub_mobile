@@ -1,0 +1,68 @@
+# Assignment 3.2, Part 8.3 — CI for the unit and widget test
+# pyramid.
+#
+# What this workflow does NOT do: run the Patrol integration test.
+# Patrol requires a connected device (an emulator on a device-farm
+# runner, or a physical device), which is a separate workflow's
+# responsibility. This workflow covers the two lower layers of the
+# pyramid — the layers `flutter test --coverage` can exercise on
+# a plain Linux runner.
+name: Flutter test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # The project's `pubspec.yaml` targets Flutter's stable channel
+      # against the SDK described by `sdk: ^3.12.0`. Pinning the
+      # Flutter version to 3.44.5 matches the local dev environment;
+      # bumping the pin should be a deliberate PR.
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.5'
+          channel: stable
+          cache: true
+
+      # `flutter pub get` restores dependencies from pubspec.lock,
+      # so CI resolves the exact package graph the local dev
+      # environment used.
+      - name: Install dependencies
+        run: flutter pub get
+
+      # `flutter analyze` returns a non-zero exit code on any error
+      # or warning (info-level lints do not fail by default). Fatal
+      # levels here make the pipeline strict.
+      - name: Analyze
+        run: flutter analyze --fatal-infos --fatal-warnings
+
+      # `flutter test --coverage` runs every test under `test/` and
+      # writes an lcov trace to `coverage/lcov.info`. The Patrol
+      # integration test lives under `integration_test/` and is not
+      # picked up by `flutter test` — it needs `patrol test` and a
+      # connected device.
+      - name: Run unit and widget tests with coverage
+        run: flutter test --coverage
+
+      # The lcov artifact is uploaded for downstream jobs (or human
+      # inspection) even when tests fail — the coverage delta is
+      # often the most useful signal on a broken PR.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/lcov.info
+          if-no-files-found: warn
+          retention-days: 14
